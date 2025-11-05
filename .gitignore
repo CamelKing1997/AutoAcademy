@@ -33,6 +33,10 @@ wheels/
 *.swo
 *~
 
+# 资源文件
+downloaded/*
+webpage/*
+
 # 系统文件
 .DS_Store
 Thumbs.db
