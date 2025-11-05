@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         FAMSUN Academy 视频自动播放助手
 // @namespace    http://tampermonkey.net/
-// @version      1.3.2
-// @description  自动播放FAMSUN Academy视频并满足观看时长要求 (v1.3.2: 优化完成检测,基于系统倒计时;修复自动跳转)
+// @version      1.3.5
+// @description  自动播放FAMSUN Academy视频并满足观看时长要求 (v1.3.5: 修复UI速度显示同步问题)
 // @author       AutoAcademy
 // @match        https://academy.famsungroup.com/*
 // @grant        GM_setValue
@@ -485,12 +485,10 @@
 
         // 检查系统倒计时是否完成
         checkSystemCompletion() {
-            // 查找系统的倒计时提示元素
+            // 只查找特定的系统倒计时元素
             const selectors = [
                 '.yxtbiz-language-slot',
-                '.yxtulcdsdk-course-player__countdown',
-                '[class*="countdown"]',
-                '[class*="language-slot"]'
+                '.yxtulcdsdk-course-player__countdown'
             ];
 
             for (const selector of selectors) {
@@ -499,22 +497,28 @@
 
                 const text = element.textContent || '';
                 
-                // 检查是否显示完成状态
-                if (text.includes('已完成') || text.includes('恭喜') || text.includes('完成本课程学习')) {
-                    return true;
-                }
-
-                // 检查倒计时是否归零或接近零
+                // 必须先检查倒计时,避免误判
                 const match = text.match(/还需\s*.*?(\d+)\s*分钟\s*(\d+)\s*秒/);
                 if (match) {
                     const minutes = parseInt(match[1]);
                     const seconds = parseInt(match[2]);
-                    Logger.debug(`系统倒计时: ${minutes}分${seconds}秒`);
+                    const totalSeconds = minutes * 60 + seconds;
+                    Logger.debug(`系统倒计时: ${minutes}分${seconds}秒 (剩余${totalSeconds}秒)`);
                     
-                    // 如果倒计时小于等于5秒,认为已完成
-                    if (minutes === 0 && seconds <= 5) {
+                    // 如果倒计时小于等于3秒,认为已完成
+                    if (totalSeconds <= 3) {
+                        Logger.log('倒计时归零,学习完成');
                         return true;
                     }
+                    
+                    // 找到有效倒计时,但未完成
+                    return false;
+                }
+                
+                // 只有在没有找到倒计时数字时,才检查完成文本
+                if (text.includes('已完成') || text.includes('恭喜')) {
+                    Logger.log('检测到完成提示文本');
+                    return true;
                 }
             }
 
@@ -524,54 +528,54 @@
         // 更新进度UI
         updateProgressUI(currentTime, duration, progress, requiredPercent) {
             const statusDiv = document.getElementById('famsun-auto-status');
-            if (statusDiv) {
-                const currentTimeStr = this.formatTime(currentTime);
-                const durationStr = this.formatTime(duration);
-                const requiredTimeStr = this.formatTime(duration * requiredPercent / 100);
-                
-                // 进度条颜色
-                let progressColor = '#4CAF50'; // 绿色
-                if (progress < requiredPercent * 0.5) {
-                    progressColor = '#f44336'; // 红色
-                } else if (progress < requiredPercent) {
-                    progressColor = '#FF9800'; // 橙色
+            if (!statusDiv) return;
+            
+            const currentTimeStr = this.formatTime(currentTime);
+            const durationStr = this.formatTime(duration);
+            
+            // 进度条颜色
+            let progressColor = '#4CAF50'; // 绿色
+            if (progress < 30) {
+                progressColor = '#f44336'; // 红色
+            } else if (progress < 80) {
+                progressColor = '#FF9800'; // 橙色
+            }
+            
+            // 获取系统倒计时信息
+            let systemCountdown = '<div style="color: #FFD700;">等待系统倒计时...</div>';
+            const countdownElement = document.querySelector('.yxtbiz-language-slot, .yxtulcdsdk-course-player__countdown');
+            if (countdownElement) {
+                const text = countdownElement.textContent || '';
+                const match = text.match(/还需\s*.*?(\d+)\s*分钟\s*(\d+)\s*秒/);
+                if (match) {
+                    const minutes = match[1];
+                    const seconds = match[2];
+                    systemCountdown = `<div style="color: #FFD700; font-weight: bold;">⏱ 系统要求: 还需${minutes}分${seconds}秒</div>`;
+                } else if (text.includes('已完成') || text.includes('恭喜')) {
+                    systemCountdown = `<div style="color: #4CAF50; font-weight: bold;">✅ 已完成学习要求</div>`;
                 }
-                
-                // 获取系统倒计时信息
-                let systemCountdown = '';
-                const countdownElement = document.querySelector('.yxtbiz-language-slot, .yxtulcdsdk-course-player__countdown');
-                if (countdownElement) {
-                    const text = countdownElement.textContent || '';
-                    const match = text.match(/还需\s*.*?(\d+)\s*分钟\s*(\d+)\s*秒/);
-                    if (match) {
-                        systemCountdown = `<div style="color: #FFD700;">🎯 系统要求: 还需${match[1]}分${match[2]}秒</div>`;
-                    } else if (text.includes('已完成') || text.includes('恭喜')) {
-                        systemCountdown = `<div style="color: #4CAF50;">✅ ${text.trim()}</div>`;
-                    }
-                }
-                
-                statusDiv.innerHTML = `
-                    <div style="font-size: 14px;">
-                        <div style="margin-bottom: 8px;">
-                            <div style="display: flex; justify-content: space-between; margin-bottom: 4px;">
-                                <span>📹 播放进度</span>
-                                <span style="font-weight: bold;">${progress}%</span>
-                            </div>
-                            <div style="background: rgba(255,255,255,0.2); height: 6px; border-radius: 3px; overflow: hidden;">
-                                <div style="background: ${progressColor}; height: 100%; width: ${progress}%; transition: width 0.3s;"></div>
-                            </div>
-                            <div style="font-size: 11px; margin-top: 2px; opacity: 0.8;">
-                                ${currentTimeStr} / ${durationStr}
-                            </div>
+            }
+            
+            statusDiv.innerHTML = `
+                <div style="font-size: 13px; line-height: 1.6;">
+                    <div style="margin-bottom: 10px;">
+                        <div style="display: flex; justify-content: space-between; margin-bottom: 4px;">
+                            <span style="font-weight: bold;">📹 播放进度</span>
+                            <span style="font-weight: bold; color: #FFD700;">${progress}%</span>
+                        </div>
+                        <div style="background: rgba(255,255,255,0.2); height: 8px; border-radius: 4px; overflow: hidden; margin-bottom: 4px;">
+                            <div style="background: ${progressColor}; height: 100%; width: ${progress}%; transition: width 0.3s;"></div>
                         </div>
                         <div style="font-size: 12px; opacity: 0.9;">
-                            ${systemCountdown}
-                            <div>📊 参考进度: ${requiredPercent}% (${requiredTimeStr})</div>
-                            <div>⚡ 速度: ${CONFIG.playbackSpeed}x ${this.getSpeedStatus()}</div>
+                            ${currentTimeStr} / ${durationStr}
                         </div>
                     </div>
-                `;
-            }
+                    <div style="font-size: 12px; border-top: 1px solid rgba(255,255,255,0.2); padding-top: 8px;">
+                        ${systemCountdown}
+                        <div style="margin-top: 4px;">⚡ 速度: ${CONFIG.playbackSpeed}x ${this.getSpeedStatus()}</div>
+                    </div>
+                </div>
+            `;
         }
 
         // 获取速度状态显示
@@ -1010,23 +1014,6 @@
                                     <option value="2.0">x2</option>
                                 </select>
                             </label>
-                            <label style="display: flex; align-items: center; margin-bottom: 5px;">
-                                <span style="flex: 1;">观看要求:</span>
-                                <select id="famsun-percent-select" style="
-                                    padding: 5px;
-                                    border-radius: 3px;
-                                    border: none;
-                                    background: white;
-                                    color: #333;
-                                    cursor: pointer;
-                                ">
-                                    <option value="80">80%</option>
-                                    <option value="85">85%</option>
-                                    <option value="90">90%</option>
-                                    <option value="95">95%</option>
-                                    <option value="100">100%</option>
-                                </select>
-                            </label>
                             <label style="display: flex; align-items: center;">
                                 <input type="checkbox" id="famsun-auto-next" checked style="margin-right: 5px;">
                                 自动播放下一个
@@ -1043,7 +1030,6 @@
         attachEvents() {
             // 设置初始值
             document.getElementById('famsun-speed-select').value = CONFIG.playbackSpeed.toString();
-            document.getElementById('famsun-percent-select').value = CONFIG.minWatchPercent.toString();
             document.getElementById('famsun-auto-next').checked = CONFIG.autoNext;
 
             // 开始按钮
@@ -1080,12 +1066,6 @@
                 }
             });
 
-            // 观看百分比选择
-            document.getElementById('famsun-percent-select').addEventListener('change', (e) => {
-                CONFIG.minWatchPercent = parseInt(e.target.value);
-                GM_setValue('minWatchPercent', CONFIG.minWatchPercent);
-            });
-
             // 自动下一个
             document.getElementById('famsun-auto-next').addEventListener('change', (e) => {
                 CONFIG.autoNext = e.target.checked;
@@ -1096,6 +1076,18 @@
         updateButtonStates(isRunning) {
             document.getElementById('famsun-start-btn').disabled = isRunning;
             document.getElementById('famsun-stop-btn').disabled = !isRunning;
+        }
+
+        // 同步UI显示
+        syncUI() {
+            const speedSelect = document.getElementById('famsun-speed-select');
+            if (speedSelect) {
+                speedSelect.value = CONFIG.playbackSpeed.toString();
+            }
+            const autoNextCheckbox = document.getElementById('famsun-auto-next');
+            if (autoNextCheckbox) {
+                autoNextCheckbox.checked = CONFIG.autoNext;
+            }
         }
     }
 
@@ -1226,6 +1218,12 @@
         }
 
         async start() {
+            // 防止重复启动
+            if (this.stateManager.getState().isRunning) {
+                Logger.log('⚠️ 自动播放已在运行中,跳过重复启动');
+                return;
+            }
+            
             Logger.log('开始自动学习...');
             
             // 第一步: 尝试点击"开始学习"或"继续学习"按钮
@@ -1294,6 +1292,11 @@
 
             // 设置播放速度
             this.videoController.setPlaybackSpeed(CONFIG.playbackSpeed);
+            
+            // 同步UI显示
+            if (this.controlPanel) {
+                this.controlPanel.syncUI();
+            }
 
             // 开始播放
             const success = await this.videoController.play();
@@ -1315,25 +1318,13 @@
                 // YXT框架按钮
                 '.yxtf-button--primary',
                 '.yxtf-button',
-                'button.yxt-button',
-                // 通用选择器
-                'button',
-                'a.button',
-                'div[role="button"]',
-                '[class*="start"]',
-                '[class*="begin"]',
-                '[class*="continue"]'
+                'button.yxt-button'
             ];
             
             const keywords = [
                 '开始学习',
                 '继续学习',
-                '开始',
-                '播放',
-                'Start',
-                'Begin',
-                'Continue',
-                'Play'
+                '播放'
             ];
             
             // 尝试查找并点击按钮
@@ -1341,6 +1332,11 @@
                 try {
                     const buttons = document.querySelectorAll(selector);
                     for (const btn of buttons) {
+                        // 排除脚本自己的按钮
+                        if (btn.id === 'famsun-start-btn' || btn.id === 'famsun-stop-btn') {
+                            continue;
+                        }
+                        
                         const text = btn.textContent.trim();
                         const isVisible = btn.offsetParent !== null;
                         
