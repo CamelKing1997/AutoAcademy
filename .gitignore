@@ -41,6 +41,7 @@ webpage/*
 # 系统文件
 .DS_Store
 Thumbs.db
+AGENTS.md
 
 # 配置文件（如果包含敏感信息）
 # config.py
