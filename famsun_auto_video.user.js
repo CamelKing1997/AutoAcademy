@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         FAMSUN Academy 视频自动播放助手
 // @namespace    http://tampermonkey.net/
-// @version      1.3.10
-// @description  自动播放FAMSUN Academy视频并满足观看时长要求 (v1.3.10: 增强按钮检测 + 添加重试机制)
+// @version      1.3.28
+// @description  自动播放FAMSUN Academy视频并满足观看时长要求 (v1.3.28: 修复重复触发和视频时长获取失败-增加处理锁和等待时间)
 // @author       AutoAcademy
 // @match        https://academy.famsungroup.com/*
 // @grant        GM_setValue
@@ -18,7 +18,7 @@
     // ==================== 配置项 ====================
     const CONFIG = {
         autoStart: GM_getValue('autoStart', true),          // 自动开始
-        playbackSpeed: GM_getValue('playbackSpeed', 1.0),   // 播放速度(1.0=正常)
+        playbackSpeed: 2.0,                                 // 播放速度固定为2倍速
         autoNext: GM_getValue('autoNext', true),            // 自动下一个
         simulateActivity: GM_getValue('simulateActivity', true), // 模拟用户活动
         debugMode: GM_getValue('debugMode', false),         // 调试模式
@@ -37,6 +37,16 @@
         static error(message, error = null) {
             const timestamp = new Date().toLocaleTimeString();
             console.error(`[FAMSUN助手 ${timestamp}] ❌ ${message}`, error || '');
+        }
+
+        static warn(message, data = null) {
+            const timestamp = new Date().toLocaleTimeString();
+            console.warn(`[FAMSUN助手 ${timestamp}] ⚠️ ${message}`, data || '');
+        }
+
+        static info(message, data = null) {
+            const timestamp = new Date().toLocaleTimeString();
+            console.info(`[FAMSUN助手 ${timestamp}] ℹ️ ${message}`, data || '');
         }
 
         static success(message) {
@@ -192,52 +202,136 @@
             this.player = null;
             this.videoElement = null;
             this.updateInterval = null;
+            this.playerType = null; // 'cyberplayer', 'jwplayer', 'videojs', 'petrel', 'native'
+            this.durationFallback = false;
+            this.metadataReady = false;
+            this.durationWarningShown = false;
+            this.metadataListenerBound = false;
+            this.lastCountdownSeconds = null;
+            this.countdownArmed = false;
+            this.countdownEverSeen = false;
+            this.keepAliveCooldownUntil = 0;
         }
 
-        // 查找视频播放器 (基于HTML分析优化)
+        // 查找视频播放器 (增强版 - 支持多种播放器类型)
         findPlayer() {
-            // 方法1: 查找 CyberPlayer
+            Logger.log('🔍 开始检测播放器类型...');
+            
+            // 方法1: 检测 JW Player (优先 - 因为UI控制依赖它)
+            const jwContainer = document.querySelector('.jw-wrapper, .jwplayer, [id*="jwplayer"]');
+            if (jwContainer) {
+                // JW Player通过data-属性或ID关联
+                const jwId = jwContainer.id || jwContainer.getAttribute('data-jw-id');
+                if (unsafeWindow.jwplayer && jwId) {
+                    try {
+                        this.player = unsafeWindow.jwplayer(jwId);
+                        if (this.player) {
+                            this.playerType = 'jwplayer';
+                            Logger.success('✅ 找到 JW Player 播放器');
+                            Logger.debug('JW Player ID:', jwId);
+                        }
+                    } catch (e) {
+                        Logger.debug('JW Player初始化失败:', e);
+                    }
+                }
+                
+                // 即使player对象获取失败,也标记为JW Player类型
+                if (!this.player && document.querySelector('.jw-playrate-label')) {
+                    this.playerType = 'jwplayer';
+                    Logger.log('🎬 检测到JW Player UI控件(未获取到player对象)');
+                }
+            }
+            
+            // 方法2: 查找 CyberPlayer (通常是封装层)
             if (unsafeWindow.cyberplayer) {
                 this.player = unsafeWindow.cyberplayer;
-                Logger.success('找到 CyberPlayer 播放器');
-                Logger.debug('CyberPlayer API:', {
+                // 如果没有检测到JW Player,才设置为CyberPlayer类型
+                if (!this.playerType) {
+                    this.playerType = 'cyberplayer';
+                    Logger.success('✅ 找到 CyberPlayer 播放器');
+                }
+                
+                // 详细检测API
+                Logger.debug('CyberPlayer API检测:', {
                     hasCurrentTime: 'currentTime' in this.player,
                     hasDuration: 'duration' in this.player,
-                    hasPlaybackRate: 'playbackRate' in this.player
+                    hasPlaybackRate: 'playbackRate' in this.player,
+                    hasSetPlaybackRate: 'setPlaybackRate' in this.player,
+                    setPlaybackRateType: typeof this.player.setPlaybackRate,
+                    playbackRateType: typeof this.player.playbackRate
                 });
             }
 
-            // 方法2: 查找 video.js
-            if (unsafeWindow.videojs) {
-                const players = unsafeWindow.videojs.getPlayers();
-                if (players && Object.keys(players).length > 0) {
-                    this.player = players[Object.keys(players)[0]];
-                    Logger.success('找到 VideoJS 播放器');
+            // 方法3: 查找 VideoJS
+            if (!this.playerType && unsafeWindow.videojs) {
+                const players = typeof unsafeWindow.videojs.getPlayers === 'function'
+                    ? unsafeWindow.videojs.getPlayers()
+                    : unsafeWindow.videojs.players;
+                const playerKeys = players ? Object.keys(players) : [];
+                if (playerKeys.length > 0) {
+                    this.player = players[playerKeys[0]];
+                    this.playerType = 'videojs';
+                    Logger.success('✅ 找到 VideoJS 播放器');
+                } else {
+                    try {
+                        const idCandidates = ['videocontainer-vjs', 'videocontainer', 'video-js'];
+                        for (const id of idCandidates) {
+                            if (!id) continue;
+                            const candidate = typeof unsafeWindow.videojs.getPlayer === 'function'
+                                ? unsafeWindow.videojs.getPlayer(id)
+                                : unsafeWindow.videojs(id);
+                            if (candidate) {
+                                this.player = candidate;
+                                this.playerType = 'videojs';
+                                Logger.success(`✅ 通过ID找到 VideoJS 播放器 (${id})`);
+                                break;
+                            }
+                        }
+                    } catch (playerError) {
+                        Logger.debug('尝试 videojs.getPlayer 失败', playerError);
+                    }
                 }
             }
 
-            // 方法3: 根据HTML分析查找特定ID的video元素
-            const videoSelectors = [
-                '#videocontainer-vjs',  // 根据HTML分析添加
-                'video',
-                '.video-js',
-                '.jw-video'
-            ];
-            
-            for (const selector of videoSelectors) {
-                this.videoElement = document.querySelector(selector);
-                if (this.videoElement) {
-                    Logger.success(`找到 video 元素: ${selector}`);
-                    break;
+            // 方法4: 查找 Petrel播放器 (海燕播放器)
+            const petrelVideo = document.querySelector('.petrel-smart-player-m3u8-track video, .petrel-player video');
+            if (petrelVideo) {
+                this.videoElement = petrelVideo;
+                if (!this.playerType) {
+                    this.playerType = 'petrel';
+                    Logger.success('✅ 找到 Petrel播放器 (海燕播放器)');
                 }
             }
 
-            // 只要找到任意一种就算成功
+            // 方法5: 查找原生video元素 (最后的兜底方案)
+            if (!this.videoElement) {
+                const videoSelectors = [
+                    '#videocontainer-vjs',  // 常见ID
+                    'video',                // 通用选择器
+                    '.video-js',
+                    '.jw-video'
+                ];
+                
+                for (const selector of videoSelectors) {
+                    this.videoElement = document.querySelector(selector);
+                    if (this.videoElement) {
+                        Logger.success(`✅ 找到 video 元素: ${selector}`);
+                        if (!this.playerType) {
+                            this.playerType = 'native';
+                        }
+                        break;
+                    }
+                }
+            }
+
+            // 总结检测结果
             if (this.player || this.videoElement) {
+                Logger.success(`🎯 播放器类型: ${this.playerType || 'unknown'}`);
+                Logger.log(`📊 检测结果: player对象=${!!this.player}, video元素=${!!this.videoElement}`);
                 return true;
             }
 
-            Logger.error('未找到视频播放器');
+            Logger.error('❌ 未找到任何视频播放器');
             return false;
         }
 
@@ -250,12 +344,22 @@
                     await this.videoElement.play();
                 }
                 Logger.success('视频开始播放');
+                
+                // 自动设置2倍速
+                await this.sleep(500); // 等待播放器初始化完成
+                this.setPlaybackSpeed(CONFIG.playbackSpeed);
+                
                 this.startMonitoring();
                 return true;
             } catch (error) {
                 Logger.error('播放失败', error);
                 return false;
             }
+        }
+
+        // 延迟函数
+        sleep(ms) {
+            return new Promise(resolve => setTimeout(resolve, ms));
         }
 
         // 暂停视频
@@ -272,58 +376,339 @@
             }
         }
 
-        // 设置播放速度
-        setPlaybackSpeed(speed) {
+        // 点击播放器UI的速度按钮 (增强版 - 支持多种播放器)
+        clickSpeedButton(speed) {
             try {
-                let success = false;
+                Logger.log(`🎬 尝试通过UI点击设置${speed}x速度 (播放器类型: ${this.playerType})`);
                 
-                // CyberPlayer API (函数调用)
-                if (this.player && typeof this.player.playbackRate === 'function') {
-                    this.player.playbackRate(speed);
-                    Logger.log(`通过CyberPlayer函数设置速度为 ${speed}x`);
-                    success = true;
+                let speedButton = null;
+                let speedSelectors = [];
+                
+                // 根据播放器类型选择最合适的选择器
+                switch (this.playerType) {
+                    case 'jwplayer':
+                        speedSelectors = [
+                            '.jw-playrate-label',           // JW Player速度标签 (最准确)
+                            '.jw-icon-playback-rate',       // JW Player速度图标
+                            '.jw-settings-playback-rate'    // JW Player设置项
+                        ];
+                        break;
+                    
+                    case 'cyberplayer':
+                        speedSelectors = [
+                            '.cyber-playbackrate-button',
+                            '.cyber-rate-button',
+                            '[class*="cyber"][class*="rate"]'
+                        ];
+                        break;
+                    
+                    case 'videojs':
+                        speedSelectors = [
+                            '.vjs-playback-rate',
+                            '.vjs-playback-rate-value',
+                            'button.vjs-playback-rate'
+                        ];
+                        break;
+                    
+                    case 'petrel':
+                    case 'native':
+                    default:
+                        // 通用选择器
+                        speedSelectors = [
+                            '.jw-playrate-label',           // 优先JW Player
+                            '.vjs-playback-rate',           // VideoJS
+                            '.cyber-playbackrate-button',   // CyberPlayer
+                            '[class*="playbackrate"]',      // 通配符
+                            '[class*="playrate"]',
+                            '[class*="speed-button"]'
+                        ];
                 }
-                // CyberPlayer 属性设置
-                else if (this.player && 'playbackRate' in this.player) {
-                    this.player.playbackRate = speed;
-                    Logger.log(`通过CyberPlayer属性设置速度为 ${speed}x`);
-                    success = true;
-                }
-                // 原生 video 元素
-                else if (this.videoElement) {
-                    this.videoElement.playbackRate = speed;
-                    Logger.log(`通过video元素设置速度为 ${speed}x`);
-                    success = true;
-                }
-                // 尝试从 window.cyberplayer 设置
-                else if (unsafeWindow.cyberplayer) {
-                    if (typeof unsafeWindow.cyberplayer.playbackRate === 'function') {
-                        unsafeWindow.cyberplayer.playbackRate(speed);
-                        Logger.log(`通过window.cyberplayer函数设置速度为 ${speed}x`);
-                        success = true;
-                    } else {
-                        unsafeWindow.cyberplayer.playbackRate = speed;
-                        Logger.log(`通过window.cyberplayer属性设置速度为 ${speed}x`);
-                        success = true;
+                
+                // 查找速度按钮
+                for (const selector of speedSelectors) {
+                    speedButton = document.querySelector(selector);
+                    if (speedButton && speedButton.offsetParent !== null) {
+                        const currentText = speedButton.textContent.trim();
+                        Logger.success(`✅ 找到速度按钮: ${selector} (文本: "${currentText}")`);
+                        
+                        // 检查是否已经是目标速度
+                        if (new RegExp(`^x?${speed}(\\.0)?x?$`, 'i').test(currentText)) {
+                            Logger.log(`🎯 速度已经是 ${speed}x，无需切换`);
+                            return true; // 已经是目标速度，返回成功
+                        }
+                        break;
                     }
                 }
                 
-                if (success) {
-                    Logger.success(`✅ 播放速度已设置为 ${speed}x`);
-                    // 验证设置是否生效
-                    setTimeout(() => {
-                        const currentSpeed = this.getCurrentSpeed();
-                        if (currentSpeed && Math.abs(currentSpeed - speed) < 0.01) {
-                            Logger.success(`✅ 速度验证成功: ${currentSpeed}x`);
-                        } else if (currentSpeed) {
-                            Logger.log(`⚠️ 当前显示速度: ${currentSpeed}x`);
+                // 如果没找到,尝试通过文本查找
+                if (!speedButton) {
+                    Logger.log('未找到速度按钮，尝试查找包含速度文本的元素');
+                    const allElements = document.querySelectorAll('button, div[role="button"], span, div[class*="button"]');
+                    for (const el of allElements) {
+                        const text = el.textContent.trim();
+                        // 匹配任意速度文本
+                        if (/^(x?[\d.]+x?|倍速|playback|speed)$/i.test(text) && el.offsetParent !== null) {
+                            speedButton = el;
+                            Logger.success(`✅ 通过文本找到速度按钮: "${text}" (类名: ${el.className})`);
+                            
+                            // 检查是否已经是目标速度
+                            if (new RegExp(`^x?${speed}(\\.0)?x?$`, 'i').test(text)) {
+                                Logger.log(`🎯 速度已经是 ${speed}x，无需切换`);
+                                return true;
+                            }
+                            break;
                         }
-                    }, 500);
-                } else {
-                    Logger.error('❌ 无法设置播放速度 - 未找到有效的 API');
+                    }
                 }
+                
+                if (!speedButton) {
+                    Logger.warn('⚠️ 未找到速度控制按钮');
+                    return false;
+                }
+                
+                // 点击速度按钮打开菜单
+                speedButton.click();
+                Logger.log('👆 已点击速度按钮，等待菜单出现...');
+                
+                // 等待菜单出现，然后查找对应速度选项
+                setTimeout(() => {
+                    // 根据播放器类型选择菜单项选择器
+                    let optionSelectors = [];
+                    if (this.playerType === 'jwplayer') {
+                        optionSelectors = ['.jw-option', '.jw-settings-content-item'];
+                    } else if (this.playerType === 'videojs') {
+                        optionSelectors = ['.vjs-menu-item'];
+                    } else if (this.playerType === 'cyberplayer') {
+                        optionSelectors = ['[class*="cyber"][class*="menu-item"]'];
+                    } else {
+                        optionSelectors = ['[class*="option"]', '[class*="menu-item"]', '[role="menuitem"]'];
+                    }
+                    
+                    // 查找所有速度选项
+                    const speedOptions = document.querySelectorAll(optionSelectors.concat([
+                        '[class*="rate"]',
+                        '[class*="speed"]'
+                    ]).join(', '));
+                    
+                    Logger.log(`📋 找到 ${speedOptions.length} 个可能的速度选项`);
+                    
+                    for (const option of speedOptions) {
+                        const text = option.textContent.trim();
+                        // 匹配 "×2", "2x", "2.0x", "x2", "2.0", "2" 等格式
+                        const speedPattern = new RegExp(`^[×x]?${speed}(\\.0)?x?$`, 'i');
+                        if (speedPattern.test(text) && option.offsetParent !== null) {
+                            Logger.success(`✅ 找到${speed}x选项 (文本: "${text}")，点击...`);
+                            option.click();
+                            
+                            // 验证是否成功
+                            setTimeout(() => {
+                                const newSpeed = this.getCurrentSpeed();
+                                if (newSpeed && Math.abs(newSpeed - speed) < 0.01) {
+                                    Logger.success(`🎉 UI点击成功! 当前速度: ${newSpeed}x`);
+                                } else {
+                                    Logger.warn(`⚠️ UI点击可能未生效, 当前速度: ${newSpeed}x`);
+                                }
+                            }, 200);
+                            return;
+                        }
+                    }
+                    Logger.debug(`未找到${speed}x速度选项 (可能菜单未打开或已经是目标速度)`);
+                }, 300);
+                
+                return true; // 返回true表示已尝试点击
             } catch (error) {
-                Logger.error('设置速度失败', error);
+                Logger.error('❌ 点击速度按钮失败:', error);
+                return false;
+            }
+        }
+
+        // 设置播放速度 (增强版 - 支持多播放器类型和多次重试)
+        setPlaybackSpeed(speed, retryCount = 0) {
+            try {
+                let methodsUsed = [];
+                let uiMethodSuccess = false;
+                let apiMethodSuccess = false;
+                
+                Logger.log(`🎯 设置播放速度为 ${speed}x (播放器: ${this.playerType}, 第${retryCount + 1}次)`);
+                
+                // ========== 方法0: UI点击 (最可靠 - 能同步UI和倒计时) ==========
+                if (retryCount === 0) {
+                    const uiClicked = this.clickSpeedButton(speed);
+                    if (uiClicked) {
+                        methodsUsed.push('✅ UI按钮点击');
+                        uiMethodSuccess = true;
+                    }
+                }
+                
+                // ========== 方法1: 播放器API调用 (根据播放器类型选择) ==========
+                switch (this.playerType) {
+                    case 'jwplayer':
+                        // JW Player API
+                        if (this.player && typeof this.player.setPlaybackRate === 'function') {
+                            try {
+                                this.player.setPlaybackRate(speed);
+                                methodsUsed.push('✅ JWPlayer.setPlaybackRate()');
+                                apiMethodSuccess = true;
+                            } catch (e) {
+                                Logger.debug('JWPlayer.setPlaybackRate()失败:', e);
+                            }
+                        }
+                        // JW Player通过jwplayer(id)获取的实例可能有不同API
+                        if (!apiMethodSuccess && this.player && typeof this.player.getPlaybackRate === 'function') {
+                            try {
+                                // JW Player 8+ 版本的API
+                                this.player.setPlaybackRate(speed);
+                                methodsUsed.push('✅ JWPlayer.setPlaybackRate() v8+');
+                                apiMethodSuccess = true;
+                            } catch (e) {
+                                Logger.debug('JWPlayer v8+ API失败:', e);
+                            }
+                        }
+                        break;
+                    
+                    case 'cyberplayer':
+                        // CyberPlayer API
+                        if (this.player && typeof this.player.setPlaybackRate === 'function') {
+                            try {
+                                this.player.setPlaybackRate(speed);
+                                methodsUsed.push('✅ CyberPlayer.setPlaybackRate()');
+                                apiMethodSuccess = true;
+                            } catch (e) {
+                                Logger.debug('CyberPlayer.setPlaybackRate()失败:', e);
+                            }
+                        }
+                        // 尝试属性赋值
+                        if (!apiMethodSuccess && this.player) {
+                            try {
+                                this.player.playbackRate = speed;
+                                methodsUsed.push('✅ CyberPlayer.playbackRate属性');
+                                apiMethodSuccess = true;
+                            } catch (e) {
+                                Logger.debug('CyberPlayer属性赋值失败:', e);
+                            }
+                        }
+                        break;
+                    
+                    case 'videojs':
+                        // VideoJS API
+                        if (this.player && typeof this.player.playbackRate === 'function') {
+                            try {
+                                this.player.playbackRate(speed);
+                                methodsUsed.push('✅ VideoJS.playbackRate()');
+                                apiMethodSuccess = true;
+                            } catch (e) {
+                                Logger.debug('VideoJS.playbackRate()失败:', e);
+                            }
+                        }
+                        break;
+                    
+                    case 'petrel':
+                    case 'native':
+                    default:
+                        // 通用方法 - 尝试常见API
+                        if (this.player) {
+                            const methods = ['setPlaybackRate', 'playbackRate', 'setSpeed', 'speed', 'setRate'];
+                            for (const method of methods) {
+                                if (typeof this.player[method] === 'function') {
+                                    try {
+                                        this.player[method](speed);
+                                        methodsUsed.push(`✅ player.${method}()`);
+                                        apiMethodSuccess = true;
+                                        break;
+                                    } catch (e) {
+                                        Logger.debug(`player.${method}()失败:`, e);
+                                    }
+                                }
+                            }
+                        }
+                }
+                
+                // ========== 方法2: 全局CyberPlayer对象 ==========
+                if (!apiMethodSuccess && unsafeWindow.cyberplayer) {
+                    if (typeof unsafeWindow.cyberplayer.setPlaybackRate === 'function') {
+                        try {
+                            unsafeWindow.cyberplayer.setPlaybackRate(speed);
+                            methodsUsed.push('✅ window.cyberplayer.setPlaybackRate()');
+                            apiMethodSuccess = true;
+                        } catch (e) {
+                            Logger.debug('window.cyberplayer API失败:', e);
+                        }
+                    }
+                }
+                
+                // ========== 方法3: 直接操作video元素 (兜底方案) ==========
+                if (this.videoElement) {
+                    try {
+                        this.videoElement.playbackRate = speed;
+                        methodsUsed.push('✅ video.playbackRate');
+                        
+                        // 触发ratechange事件
+                        const event = new Event('ratechange', { bubbles: true, cancelable: false });
+                        this.videoElement.dispatchEvent(event);
+                        methodsUsed.push('✅ ratechange事件');
+                    } catch (e) {
+                        Logger.debug('video元素操作失败:', e);
+                    }
+                }
+                
+                // ========== 方法4: 批量设置所有video元素 ==========
+                const allVideos = document.querySelectorAll('video');
+                if (allVideos.length > 0) {
+                    let videoCount = 0;
+                    allVideos.forEach((video) => {
+                        try {
+                            video.playbackRate = speed;
+                            videoCount++;
+                        } catch (e) {
+                            Logger.debug('设置video元素失败:', e);
+                        }
+                    });
+                    if (videoCount > 0) {
+                        methodsUsed.push(`✅ ${videoCount}个video元素`);
+                    }
+                }
+                
+                // ========== 总结和验证 ==========
+                if (methodsUsed.length > 0) {
+                    Logger.success(`📊 速度设置完成: ${methodsUsed.join(' | ')}`);
+                } else {
+                    Logger.warn('⚠️ 所有速度设置方法均失败');
+                }
+                
+                if (!uiMethodSuccess && !apiMethodSuccess) {
+                    Logger.error('❌ 警告: UI点击和API调用均未成功，只设置了video元素');
+                }
+                
+                // 延迟验证 + 重试机制
+                setTimeout(() => {
+                    const currentSpeed = this.getCurrentSpeed();
+                    Logger.log(`🔍 速度验证 - video: ${currentSpeed}x, 期望: ${speed}x`);
+                    
+                    // 检查player的playbackRate
+                    if (this.player) {
+                        const playerSpeed = typeof this.player.playbackRate === 'function' 
+                            ? this.player.playbackRate() 
+                            : this.player.playbackRate;
+                        Logger.log(`🔍 ${this.playerType} 显示速度: ${playerSpeed}`);
+                    }
+                    
+                    // 验证是否成功
+                    const tolerance = 0.01;
+                    if (currentSpeed && Math.abs(currentSpeed - speed) < tolerance) {
+                        Logger.success(`✅ 速度验证成功: ${currentSpeed}x`);
+                    } else if (retryCount < 3) {
+                        Logger.warn(`⚠️ 速度验证失败(当前:${currentSpeed}x), 1秒后重试...`);
+                        setTimeout(() => this.setPlaybackSpeed(speed, retryCount + 1), 1000);
+                    } else {
+                        Logger.error(`❌ 速度设置失败，已重试${retryCount + 1}次`);
+                    }
+                }, 500);
+                
+            } catch (error) {
+                Logger.error('❌ 设置速度异常:', error);
+                if (retryCount < 3) {
+                    setTimeout(() => this.setPlaybackSpeed(speed, retryCount + 1), 1000);
+                }
             }
         }
 
@@ -421,6 +806,123 @@
             }
             return 0;
         }
+        
+        // 重置倒计时状态
+        resetCountdownState() {
+            this.lastCountdownSeconds = null;
+            this.countdownArmed = false;
+            this.countdownEverSeen = false;
+            this.keepAliveCooldownUntil = 0;
+        }
+
+        // 确保播放器在播放状态
+        ensurePlaying() {
+            try {
+                if (this.playerType === 'jwplayer' && this.player && typeof this.player.play === 'function') {
+                    this.player.play(true);
+                } else if (this.player && typeof this.player.play === 'function') {
+                    this.player.play();
+                }
+            } catch (error) {
+                Logger.debug('尝试调用播放器播放失败', error);
+            }
+
+            if (this.videoElement && this.videoElement.paused) {
+                const playPromise = this.videoElement.play();
+                if (playPromise && typeof playPromise.catch === 'function') {
+                    playPromise.catch(() => {});
+                }
+            }
+        }
+
+        // 跳转到指定时间点
+        seekToTime(seconds) {
+            let handled = false;
+
+            if (this.player && typeof this.player.seek === 'function') {
+                try {
+                    this.player.seek(seconds);
+                    handled = true;
+                } catch (error) {
+                    Logger.debug('播放器seek失败', error);
+                }
+            }
+
+            if (!handled && this.videoElement) {
+                try {
+                    this.videoElement.currentTime = seconds;
+                    handled = true;
+                } catch (error) {
+                    Logger.debug('video元素seek失败', error);
+                }
+            }
+
+            return handled;
+        }
+
+        // 确保倒计时继续进行
+        ensureCountdownActive(duration, currentTime, hasDuration) {
+            if (!this.countdownEverSeen) return;
+            if (this.lastCountdownSeconds === null || this.lastCountdownSeconds <= 3) return;
+
+            const now = Date.now();
+            if (now < this.keepAliveCooldownUntil) return;
+
+            let effectiveDuration = duration;
+            if (!hasDuration || !effectiveDuration || !isFinite(effectiveDuration)) {
+                if (this.videoElement && isFinite(this.videoElement.duration)) {
+                    effectiveDuration = this.videoElement.duration;
+                } else {
+                    this.ensurePlaying();
+                    return;
+                }
+            }
+
+            if (!effectiveDuration || !isFinite(effectiveDuration) || effectiveDuration <= 0) {
+                this.ensurePlaying();
+                return;
+            }
+
+            const videoElementState = this.videoElement ? {
+                paused: this.videoElement.paused,
+                ended: this.videoElement.ended
+            } : { paused: false, ended: false };
+
+            let playerStatePaused = false;
+            try {
+                if (this.playerType === 'jwplayer' && this.player && typeof this.player.getState === 'function') {
+                    const state = this.player.getState();
+                    if (['idle', 'paused', 'complete', 'buffering'].includes(state)) {
+                        playerStatePaused = true;
+                    }
+                }
+            } catch (error) {
+                Logger.debug('获取播放器状态失败', error);
+            }
+
+            const nearEndThreshold = Math.max(effectiveDuration * 0.05, 2);
+            const nearEnd = isFinite(currentTime) && (effectiveDuration - currentTime <= nearEndThreshold);
+            const pausedOrEnded = videoElementState.paused || videoElementState.ended || playerStatePaused;
+
+            if (!pausedOrEnded && !nearEnd) return;
+
+            let targetTime = effectiveDuration * 0.01;
+            if (!isFinite(targetTime) || targetTime < 0) {
+                targetTime = 0;
+            }
+
+            if (effectiveDuration - targetTime < 2) {
+                targetTime = Math.max(0, effectiveDuration - Math.max(5, effectiveDuration * 0.1));
+            }
+
+            const seeked = this.seekToTime(targetTime);
+            this.ensurePlaying();
+            this.keepAliveCooldownUntil = now + 8000;
+
+            if (seeked) {
+                Logger.log(`⏱ 倒计时剩余 ${this.lastCountdownSeconds}s，重新唤醒播放器 (跳转至 ${targetTime.toFixed(1)}s)`);
+            }
+        }
 
         // 监控播放进度
         startMonitoring() {
@@ -428,38 +930,65 @@
                 clearInterval(this.updateInterval);
             }
 
+            this.resetCountdownState();
+
             let retryCount = 0;
             const maxRetries = 5;
+            let speedCheckCounter = 0; // 速度检查计数器
 
             this.updateInterval = setInterval(() => {
                 const currentTime = this.getCurrentTime();
                 const duration = this.getDuration();
-                
-                // 如果无法获取时长,尝试重新查找播放器
-                if (duration === 0 || isNaN(duration)) {
-                    retryCount++;
-                    if (retryCount <= maxRetries) {
-                        Logger.debug(`等待视频加载... (${retryCount}/${maxRetries})`);
-                        // 尝试重新获取 video 元素,支持Petrel播放器
-                        if (!this.videoElement) {
-                            // 优先检测Petrel播放器
-                            this.videoElement = document.querySelector('.petrel-smart-player-m3u8-track video') ||
-                                               document.querySelector('.petrel-player video') ||
-                                               document.querySelector('video');
-                            
-                            if (this.videoElement && this.videoElement.closest('.petrel-player')) {
-                                Logger.info('检测到Petrel播放器(海燕播放器)');
-                                this.playerType = 'petrel';
+                const hasDuration = typeof duration === 'number' && isFinite(duration) && duration > 0;
+                const requiredPercent = CONFIG.minWatchPercent;
+
+                if (!hasDuration) {
+                    if (!this.metadataListenerBound && this.videoElement) {
+                        this.metadataListenerBound = true;
+                        this.videoElement.addEventListener('loadedmetadata', () => {
+                            this.metadataReady = true;
+                            Logger.success('✅ 视频元数据已加载');
+                        }, { once: true });
+                    }
+
+                    if (!this.durationFallback) {
+                        retryCount++;
+                        if (retryCount <= maxRetries) {
+                            Logger.debug(`等待视频时长信息... (${retryCount}/${maxRetries})`);
+                            if (!this.videoElement) {
+                                this.videoElement = document.querySelector('.petrel-smart-player-m3u8-track video') ||
+                                                   document.querySelector('.petrel-player video') ||
+                                                   document.querySelector('video');
+
+                                if (this.videoElement && this.videoElement.closest('.petrel-player')) {
+                                    Logger.info('检测到Petrel播放器(海燕播放器)');
+                                    this.playerType = 'petrel';
+                                }
+                            }
+                        } else {
+                            this.durationFallback = true;
+                            if (!this.durationWarningShown) {
+                                Logger.warn('⚠️ 未能读取视频总时长，将改用系统倒计时判定完成');
+                                this.durationWarningShown = true;
                             }
                         }
-                        return;
-                    } else if (retryCount === maxRetries + 1) {
-                        Logger.error('无法获取视频时长,请检查视频是否正常加载');
+                    }
+
+                    this.updateProgressUI(currentTime, duration, null, requiredPercent);
+
+                    const countdownCompletedFallback = this.checkSystemCompletion();
+
+                    if (!countdownCompletedFallback) {
+                        this.ensureCountdownActive(duration, currentTime, hasDuration);
+                    }
+
+                    if (countdownCompletedFallback) {
+                        Logger.success('✅ 系统提示已完成学习要求');
+                        this.onVideoComplete();
                     }
                     return;
                 }
-                
-                // 成功获取到时长
+
                 if (retryCount > 0 && retryCount <= maxRetries) {
                     Logger.success(`成功获取视频信息 (时长: ${this.formatTime(duration)})`);
                     if (this.playerType === 'petrel') {
@@ -467,27 +996,42 @@
                     }
                     retryCount = 0;
                 }
+
+                // 每5秒检查一次播放速度，确保速度保持在2倍速
+                speedCheckCounter++;
+                if (speedCheckCounter % 5 === 0) {
+                    const currentSpeed = this.getCurrentSpeed();
+                    if (currentSpeed && Math.abs(currentSpeed - CONFIG.playbackSpeed) > 0.01) {
+                        Logger.warn(`⚠️ 检测到速度被重置为 ${currentSpeed}x，重新设置为 ${CONFIG.playbackSpeed}x`);
+                        this.setPlaybackSpeed(CONFIG.playbackSpeed);
+                    }
+                }
                 
-                const progress = (currentTime / duration * 100).toFixed(1);
-                const requiredPercent = CONFIG.minWatchPercent;
+                const progress = hasDuration ? (currentTime / duration * 100).toFixed(1) : null;
                 
                 this.stateManager.setState({
                     watchedDuration: currentTime,
-                    requiredDuration: duration * requiredPercent / 100
+                    requiredDuration: hasDuration ? duration * requiredPercent / 100 : 0
                 });
 
                 // 更新UI显示
                 this.updateProgressUI(currentTime, duration, progress, requiredPercent);
 
+                const countdownCompleted = this.checkSystemCompletion();
+
+                if (!countdownCompleted) {
+                    this.ensureCountdownActive(duration, currentTime, hasDuration);
+                }
+
                 // 优先检查系统倒计时(更准确)
-                if (this.checkSystemCompletion()) {
+                if (countdownCompleted) {
                     Logger.success('✅ 系统提示已完成学习要求');
                     this.onVideoComplete();
                     return;
                 }
 
                 // 备用方案: 检查播放进度
-                if (progress >= requiredPercent) {
+                if (!this.countdownEverSeen && progress !== null && progress >= requiredPercent) {
                     Logger.success(`已完成观看要求 (${progress}% >= ${requiredPercent}%)`);
                     this.onVideoComplete();
                 }
@@ -502,11 +1046,16 @@
                 '.yxtulcdsdk-course-player__countdown'
             ];
 
+            let countdownElementFound = false;
+
             for (const selector of selectors) {
                 const element = document.querySelector(selector);
                 if (!element) continue;
 
+                countdownElementFound = true;
                 const text = element.textContent || '';
+                const compactText = text.replace(/\s+/g, '');
+                const looksLikeCountdown = /还需|倒计时|剩余/.test(compactText);
                 
                 // 特殊处理: PDF课件的完成提示("需完成课程内容,才能获得X学分")
                 // 这种情况下没有倒计时,只要能看到这个文本就说明内容已经展示完毕
@@ -538,64 +1087,90 @@
                 // 2. "还需 2小时 4秒" (小时+秒,无分钟)
                 // 3. "还需 7分钟 30秒" 或 "还需 7分 30秒" (分钟+秒)
                 // 4. "还需 22秒" (只有秒数)
-                let totalSeconds = 0;
-                let hours = 0;
-                let minutes = 0;
-                let seconds = 0;
-                
-                // 优先匹配: 小时+分钟+秒 格式
+                let totalSeconds = null;
+                let countdownLabel = '';
+
                 let match = text.match(/还需\s*(\d+)\s*小时\s*(\d+)\s*分(?:钟)?\s*(\d+)\s*秒/);
                 if (match) {
-                    hours = parseInt(match[1]);
-                    minutes = parseInt(match[2]);
-                    seconds = parseInt(match[3]);
+                    const hours = parseInt(match[1], 10);
+                    const minutes = parseInt(match[2], 10);
+                    const seconds = parseInt(match[3], 10);
                     totalSeconds = hours * 3600 + minutes * 60 + seconds;
-                    Logger.debug(`系统倒计时: ${hours}小时${minutes}分${seconds}秒 (剩余${totalSeconds}秒)`);
+                    countdownLabel = `${hours}小时${minutes}分${seconds}秒`;
                 } else {
-                    // 尝试匹配: 小时+秒 格式(无分钟)
                     match = text.match(/还需\s*(\d+)\s*小时\s*(\d+)\s*秒/);
                     if (match) {
-                        hours = parseInt(match[1]);
-                        seconds = parseInt(match[2]);
+                        const hours = parseInt(match[1], 10);
+                        const seconds = parseInt(match[2], 10);
                         totalSeconds = hours * 3600 + seconds;
-                        Logger.debug(`系统倒计时: ${hours}小时${seconds}秒 (剩余${totalSeconds}秒)`);
+                        countdownLabel = `${hours}小时${seconds}秒`;
                     } else {
-                        // 尝试匹配有分钟的格式
                         match = text.match(/还需\s*(\d+)\s*分(?:钟)?\s*(\d+)\s*秒/);
                         if (match) {
-                            minutes = parseInt(match[1]);
-                            seconds = parseInt(match[2]);
+                            const minutes = parseInt(match[1], 10);
+                            const seconds = parseInt(match[2], 10);
                             totalSeconds = minutes * 60 + seconds;
-                            Logger.debug(`系统倒计时: ${minutes}分${seconds}秒 (剩余${totalSeconds}秒)`);
+                            countdownLabel = `${minutes}分${seconds}秒`;
                         } else {
-                            // 尝试匹配只有秒的格式
                             match = text.match(/还需\s*(\d+)\s*秒/);
                             if (match) {
-                                seconds = parseInt(match[1]);
+                                const seconds = parseInt(match[1], 10);
                                 totalSeconds = seconds;
-                                Logger.debug(`系统倒计时: ${seconds}秒 (剩余${totalSeconds}秒)`);
+                                countdownLabel = `${seconds}秒`;
                             }
                         }
                     }
                 }
-                
-                // 如果找到了倒计时
-                if (totalSeconds > 0) {
-                    // 如果倒计时小于等于3秒,认为已完成
+
+                if (totalSeconds !== null) {
+                    if (!this.countdownEverSeen) {
+                        this.countdownEverSeen = true;
+                    }
+
+                    this.lastCountdownSeconds = totalSeconds;
+
+                    if (totalSeconds <= 30 && !this.countdownArmed) {
+                        this.countdownArmed = true;
+                        Logger.debug('倒计时进入30秒监控区间');
+                    }
+
+                    if (countdownLabel) {
+                        Logger.debug(`系统倒计时: ${countdownLabel} (剩余${totalSeconds}秒)`);
+                    } else {
+                        Logger.debug(`系统倒计时剩余约 ${totalSeconds} 秒`);
+                    }
+
                     if (totalSeconds <= 3) {
                         Logger.log('倒计时归零,学习完成');
+                        this.resetCountdownState();
                         return true;
                     }
-                    
-                    // 找到有效倒计时,但未完成
+
                     return false;
                 }
-                
-                // 只有在没有找到倒计时数字时,才检查完成文本
+
+                if (looksLikeCountdown) {
+                    this.countdownEverSeen = true;
+                    this.lastCountdownSeconds = null;
+                    Logger.debug('检测到倒计时元素但未解析到数字,等待更新...');
+                    continue;
+                }
+
                 if (text.includes('已完成') || text.includes('恭喜')) {
                     Logger.log('检测到完成提示文本');
+                    this.resetCountdownState();
                     return true;
                 }
+            }
+
+            if (!countdownElementFound) {
+                if (this.countdownEverSeen && this.countdownArmed) {
+                    Logger.success('倒计时面板已消失,判定课程完成');
+                    this.resetCountdownState();
+                    return true;
+                }
+
+                this.lastCountdownSeconds = null;
             }
 
             return false;
@@ -605,16 +1180,20 @@
         updateProgressUI(currentTime, duration, progress, requiredPercent) {
             const statusDiv = document.getElementById('famsun-auto-status');
             if (!statusDiv) return;
-            
+
+            const numericProgress = progress !== null && !isNaN(progress) ? parseFloat(progress) : null;
+            const progressDisplay = numericProgress !== null ? `${numericProgress}%` : '⏳';
             const currentTimeStr = this.formatTime(currentTime);
-            const durationStr = this.formatTime(duration);
-            
-            // 进度条颜色
-            let progressColor = '#4CAF50'; // 绿色
-            if (progress < 30) {
-                progressColor = '#f44336'; // 红色
-            } else if (progress < 80) {
-                progressColor = '#FF9800'; // 橙色
+            const hasDuration = typeof duration === 'number' && isFinite(duration) && duration > 0;
+            const durationStr = hasDuration ? this.formatTime(duration) : '--:--';
+
+            let progressColor = '#4CAF50';
+            if (numericProgress === null) {
+                progressColor = '#9E9E9E';
+            } else if (numericProgress < 30) {
+                progressColor = '#f44336';
+            } else if (numericProgress < 80) {
+                progressColor = '#FF9800';
             }
             
             // 获取系统倒计时信息
@@ -683,19 +1262,22 @@
                 }
             }
             
+            const fallbackNote = hasDuration ? '' : '<div style="font-size: 11px; color: #FFD700; margin-top: 4px;">⏱ 使用倒计时监控进度</div>';
+
             statusDiv.innerHTML = `
                 <div style="font-size: 13px; line-height: 1.6;">
                     <div style="margin-bottom: 10px;">
                         <div style="display: flex; justify-content: space-between; margin-bottom: 4px;">
                             <span style="font-weight: bold;">📹 播放进度</span>
-                            <span style="font-weight: bold; color: #FFD700;">${progress}%</span>
+                            <span style="font-weight: bold; color: #FFD700;">${progressDisplay}</span>
                         </div>
                         <div style="background: rgba(255,255,255,0.2); height: 8px; border-radius: 4px; overflow: hidden; margin-bottom: 4px;">
-                            <div style="background: ${progressColor}; height: 100%; width: ${progress}%; transition: width 0.3s;"></div>
+                            <div style="background: ${progressColor}; height: 100%; width: ${numericProgress !== null ? numericProgress : 0}%; transition: width 0.3s;"></div>
                         </div>
                         <div style="font-size: 12px; opacity: 0.9;">
                             ${currentTimeStr} / ${durationStr}
                         </div>
+                        ${fallbackNote}
                     </div>
                     <div style="font-size: 12px; border-top: 1px solid rgba(255,255,255,0.2); padding-top: 8px;">
                         ${systemCountdown}
@@ -752,25 +1334,14 @@
             if (completionButton && completionButton.offsetParent !== null) {
                 Logger.success('找到完成对话框按钮,点击继续学习下一章节');
                 completionButton.click();
-                
-                // 等待页面跳转,然后重新启动自动播放
-                setTimeout(() => {
-                    Logger.log('页面已跳转到下一章节,准备重新启动...');
-                    if (this.autoPlayer) {
-                        this.autoPlayer.start();
-                    }
-                }, 3000);
+                // 🎯 移除手动start(),让课程切换检测自动触发
                 return;
             }
             
             // 方法2: 通过课程大纲查找下一个未完成的课程
             if (this.findAndClickNextCourseInCatalog()) {
-                setTimeout(() => {
-                    Logger.log('已通过课程大纲跳转到下一课程,准备重新启动...');
-                    if (this.autoPlayer) {
-                        this.autoPlayer.start();
-                    }
-                }, 3000);
+                Logger.log('已通过课程大纲跳转到下一课程');
+                // 🎯 移除手动start(),让课程切换检测自动触发
                 return;
             }
             
@@ -779,22 +1350,14 @@
                 if (unsafeWindow.next && typeof unsafeWindow.next === 'function') {
                     Logger.log('使用原生next()函数');
                     unsafeWindow.next();
-                    setTimeout(() => {
-                        if (this.autoPlayer) {
-                            this.autoPlayer.start();
-                        }
-                    }, 3000);
+                    // 🎯 移除手动start(),让课程切换检测自动触发
                     return;
                 }
                 
                 if (unsafeWindow.nextPage && typeof unsafeWindow.nextPage === 'function') {
                     Logger.log('使用原生nextPage()函数');
                     unsafeWindow.nextPage();
-                    setTimeout(() => {
-                        if (this.autoPlayer) {
-                            this.autoPlayer.start();
-                        }
-                    }, 3000);
+                    // 🎯 移除手动start(),让课程切换检测自动触发
                     return;
                 }
             } catch (error) {
@@ -833,11 +1396,7 @@
                              text.includes('Continue'))) {
                             Logger.log('点击下一个按钮', {selector, text});
                             btn.click();
-                            setTimeout(() => {
-                                if (this.autoPlayer) {
-                                    this.autoPlayer.start();
-                                }
-                            }, 3000);
+                            // 🎯 移除手动start(),让课程切换检测自动触发
                             return;
                         }
                     }
@@ -857,6 +1416,7 @@
                      text === 'Next')) {
                     Logger.log('通过文本找到按钮', text);
                     btn.click();
+                    // 🎯 移除手动start(),让课程切换检测自动触发
                     return;
                 }
             }
@@ -868,50 +1428,98 @@
         findAndClickNextCourseInCatalog() {
             Logger.log('尝试通过课程大纲查找下一个未完成课程...');
             
-            // 查找课程大纲容器
+            // 方法1: 查找课程播放页的左侧目录
             const catalog = document.querySelector('.yxtulcdsdk-catalog');
-            if (!catalog) {
-                Logger.debug('未找到课程大纲容器');
-                return false;
-            }
-            
-            // 获取所有课程项
-            const courseItems = catalog.querySelectorAll('li');
-            let foundCurrent = false;
-            
-            for (const item of courseItems) {
-                // 跳过章节标题（只处理课程项）
-                const courseNameElement = item.querySelector('.item');
-                if (!courseNameElement) continue;
+            if (catalog) {
+                const courseItems = catalog.querySelectorAll('li');
+                let foundCurrent = false;
                 
-                // 如果是当前正在学习的课程
-                if (item.classList.contains('liactive')) {
-                    foundCurrent = true;
-                    Logger.debug('找到当前课程:', courseNameElement.textContent.trim());
-                    continue;
-                }
-                
-                // 如果已经找到当前课程,检查下一个课程是否未完成
-                if (foundCurrent) {
-                    // 检查是否为未完成课程（空心圆图标或半圆图标）
-                    const statusIcon = item.querySelector('svg');
-                    if (statusIcon) {
-                        const iconPath = statusIcon.querySelector('path[fill="currentColor"]');
-                        const isCompleted = statusIcon.querySelector('path[stroke="#FFF"]');
-                        
-                        // 如果不是已完成状态（没有绿色对勾）
-                        if (!isCompleted && iconPath) {
-                            Logger.success('找到下一个未完成课程:', courseNameElement.textContent.trim());
-                            // 点击课程项
-                            const clickTarget = item.querySelector('.hand') || item;
-                            clickTarget.click();
-                            return true;
+                for (const item of courseItems) {
+                    // 跳过章节标题（只处理课程项）
+                    const courseNameElement = item.querySelector('.item');
+                    if (!courseNameElement) continue;
+                    
+                    // 如果是当前正在学习的课程
+                    if (item.classList.contains('liactive')) {
+                        foundCurrent = true;
+                        Logger.debug('找到当前课程:', courseNameElement.textContent.trim());
+                        continue;
+                    }
+                    
+                    // 如果已经找到当前课程,检查下一个课程是否未完成
+                    if (foundCurrent) {
+                        // 检查是否为未完成课程（空心圆图标或半圆图标）
+                        const statusIcon = item.querySelector('svg');
+                        if (statusIcon) {
+                            const iconPath = statusIcon.querySelector('path[fill="currentColor"]');
+                            const isCompleted = statusIcon.querySelector('path[stroke="#FFF"]');
+                            
+                            // 如果不是已完成状态（没有绿色对勾）
+                            if (!isCompleted && iconPath) {
+                                Logger.success('找到下一个未完成课程:', courseNameElement.textContent.trim());
+                                // 点击课程项
+                                const clickTarget = item.querySelector('.hand') || item;
+                                clickTarget.click();
+                                return true;
+                            }
                         }
                     }
                 }
+                
+                Logger.debug('在播放页目录中未找到下一个未完成课程');
             }
             
-            Logger.debug('未在课程大纲中找到下一个未完成课程');
+            // 方法2: 查找课程大纲页面（不在播放页时）
+            const chapterItems = document.querySelectorAll('.yxtulcdsdk-course-page__chapter-item');
+            if (chapterItems.length > 0) {
+                Logger.log('检测到课程大纲页面，共' + chapterItems.length + '个子课程');
+                
+                // 寻找当前正在学习的课程（有color-primary-6类的标题）
+                let currentIndex = -1;
+                for (let i = 0; i < chapterItems.length; i++) {
+                    const titleElement = chapterItems[i].querySelector('.yxtulcdsdk-flex-1');
+                    if (titleElement && titleElement.classList.contains('color-primary-6')) {
+                        currentIndex = i;
+                        Logger.debug('找到当前学习课程(索引' + i + '):', titleElement.textContent.trim());
+                        break;
+                    }
+                }
+                
+                // 从当前课程的下一个开始查找未完成的课程
+                const startIndex = currentIndex >= 0 ? currentIndex + 1 : 0;
+                
+                for (let i = startIndex; i < chapterItems.length; i++) {
+                    const item = chapterItems[i];
+                    const statusIcon = item.querySelector('.yxtulcdsdk-course-page__chapter-lock svg');
+                    
+                    if (statusIcon) {
+                        const titleElement = item.querySelector('.yxtulcdsdk-flex-1');
+                        const courseName = titleElement ? titleElement.textContent.trim() : '';
+                        
+                        // 检查是否为未完成状态
+                        // 已完成: 有绿色对勾 (path[stroke="#FFF"])
+                        // 进行中: 半圆图标 (fill-rule="nonzero" 且只有一个path)
+                        // 未开始: 空心圆 (fill-rule="nonzero" 且只有一个path)
+                        const completedIcon = statusIcon.querySelector('path[stroke="#FFF"]');
+                        
+                        if (!completedIcon) {
+                            // 找到未完成的课程，点击"开始学习"或"继续学习"按钮
+                            const button = item.querySelector('.yxtf-button');
+                            if (button) {
+                                const buttonText = button.textContent.trim();
+                                Logger.success(`找到下一个未完成课程(索引${i}): ${courseName}，点击"${buttonText}"按钮`);
+                                button.click();
+                                return true;
+                            }
+                        }
+                    }
+                }
+                
+                Logger.log('课程大纲中所有后续课程均已完成');
+                return false;
+            }
+            
+            Logger.debug('未找到课程大纲');
             return false;
         }
 
@@ -921,6 +1529,8 @@
                 clearInterval(this.updateInterval);
                 this.updateInterval = null;
             }
+
+            this.resetCountdownState();
         }
     }
 
@@ -1178,50 +1788,7 @@
                         ">
                             等待视频加载...
                         </div>
-                        <div style="display: flex; gap: 5px; margin-bottom: 10px;">
-                            <button id="famsun-start-btn" style="
-                                flex: 1;
-                                background: #4CAF50;
-                                border: none;
-                                color: white;
-                                padding: 10px;
-                                border-radius: 5px;
-                                cursor: pointer;
-                                font-weight: bold;
-                            ">▶ 开始</button>
-                            <button id="famsun-stop-btn" style="
-                                flex: 1;
-                                background: #f44336;
-                                border: none;
-                                color: white;
-                                padding: 10px;
-                                border-radius: 5px;
-                                cursor: pointer;
-                                font-weight: bold;
-                            " disabled>⏸ 停止</button>
-                        </div>
                         <div style="font-size: 12px;">
-                            <label style="display: flex; align-items: center; margin-bottom: 5px;">
-                                <span style="flex: 1;">播放速度:</span>
-                                <select id="famsun-speed-select" style="
-                                    padding: 6px !important;
-                                    border-radius: 4px !important;
-                                    border: 1px solid rgba(0,0,0,0.12) !important;
-                                    background: #ffffff !important;
-                                    color: #333333 !important;
-                                    cursor: pointer !important;
-                                    min-width: 90px !important;
-                                    width: 90px !important;
-                                    box-sizing: border-box !important;
-                                ">
-                                    <option value="0.5">x0.5</option>
-                                    <option value="0.75">x0.75</option>
-                                    <option value="1.0">x1</option>
-                                    <option value="1.25">x1.25</option>
-                                    <option value="1.5">x1.5</option>
-                                    <option value="2.0">x2</option>
-                                </select>
-                            </label>
                             <label style="display: flex; align-items: center;">
                                 <input type="checkbox" id="famsun-auto-next" checked style="margin-right: 5px;">
                                 自动播放下一个
@@ -1237,20 +1804,7 @@
 
         attachEvents() {
             // 设置初始值
-            document.getElementById('famsun-speed-select').value = CONFIG.playbackSpeed.toString();
             document.getElementById('famsun-auto-next').checked = CONFIG.autoNext;
-
-            // 开始按钮
-            document.getElementById('famsun-start-btn').addEventListener('click', () => {
-                this.autoPlayer.start();
-                this.updateButtonStates(true);
-            });
-
-            // 停止按钮
-            document.getElementById('famsun-stop-btn').addEventListener('click', () => {
-                this.autoPlayer.stop();
-                this.updateButtonStates(false);
-            });
 
             // 折叠按钮
             document.getElementById('famsun-toggle-panel').addEventListener('click', (e) => {
@@ -1265,15 +1819,6 @@
                 }
             });
 
-            // 速度选择
-            document.getElementById('famsun-speed-select').addEventListener('change', (e) => {
-                CONFIG.playbackSpeed = parseFloat(e.target.value);
-                GM_setValue('playbackSpeed', CONFIG.playbackSpeed);
-                if (this.autoPlayer.videoController) {
-                    this.autoPlayer.videoController.setPlaybackSpeed(CONFIG.playbackSpeed);
-                }
-            });
-
             // 自动下一个
             document.getElementById('famsun-auto-next').addEventListener('change', (e) => {
                 CONFIG.autoNext = e.target.checked;
@@ -1281,17 +1826,8 @@
             });
         }
 
-        updateButtonStates(isRunning) {
-            document.getElementById('famsun-start-btn').disabled = isRunning;
-            document.getElementById('famsun-stop-btn').disabled = !isRunning;
-        }
-
         // 同步UI显示
         syncUI() {
-            const speedSelect = document.getElementById('famsun-speed-select');
-            if (speedSelect) {
-                speedSelect.value = CONFIG.playbackSpeed.toString();
-            }
             const autoNextCheckbox = document.getElementById('famsun-auto-next');
             if (autoNextCheckbox) {
                 autoNextCheckbox.checked = CONFIG.autoNext;
@@ -1308,6 +1844,13 @@
             this.pdfController = null;
             this.controlPanel = null;
             this.contentType = null; // 'video' or 'pdf'
+            this.currentCourseUrl = null; // 当前课程URL
+            this.lastCheckedUrl = null; // 上次检查的URL (用于智能过滤)
+            this.lastVideoSrc = null; // 上次视频源 (用于智能过滤)
+            this.lastNormalizedVideoSrc = null;
+            this.lastCourseKey = null;
+            this.urlCheckInterval = null; // URL检查定时器
+            this._isHandlingCourseChange = false; // 是否正在处理课程切换
         }
 
         async init() {
@@ -1335,12 +1878,312 @@
             // 注册菜单命令
             this.registerMenuCommands();
 
+            // 启动课程切换监听
+            this.startCourseChangeDetection();
+
             Logger.success('初始化完成');
 
             // 如果配置自动开始，则自动启动
             if (CONFIG.autoStart) {
                 setTimeout(() => this.start(), 2000);
             }
+        }
+
+        // 启动课程切换检测
+        startCourseChangeDetection() {
+            // 记录当前URL和视频源
+            this.currentCourseUrl = window.location.href;
+            this.lastCheckedUrl = window.location.href;
+            const currentVideo = document.querySelector('video');
+            this.lastVideoSrc = currentVideo ? currentVideo.src : null;
+            this.lastNormalizedVideoSrc = this.normalizeVideoSrc(this.lastVideoSrc);
+            this.lastCourseKey = this.getCurrentCourseKey();
+            
+            // 方法1: 监听URL变化 (SPA页面)
+            let lastUrl = window.location.href;
+            this.urlCheckInterval = setInterval(() => {
+                const currentUrl = window.location.href;
+                if (currentUrl !== lastUrl) {
+                    Logger.log('🔄 检测到URL变化，准备重新启动...');
+                    lastUrl = currentUrl;
+                    this.handleCourseChange();
+                }
+            }, 1000);
+            
+            // 方法2: 监听pushState和replaceState (SPA路由)
+            const originalPushState = history.pushState;
+            const originalReplaceState = history.replaceState;
+            
+            history.pushState = function(...args) {
+                originalPushState.apply(this, args);
+                Logger.log('🔄 检测到pushState导航，准备重新启动...');
+                autoPlayer.handleCourseChange();
+            };
+            
+            history.replaceState = function(...args) {
+                originalReplaceState.apply(this, args);
+                Logger.log('🔄 检测到replaceState导航，准备重新启动...');
+                autoPlayer.handleCourseChange();
+            };
+            
+            // 方法3: 监听popstate (浏览器前进后退)
+            window.addEventListener('popstate', () => {
+                Logger.log('🔄 检测到popstate事件，准备重新启动...');
+                this.handleCourseChange();
+            });
+            
+            // 方法4: 监听DOM变化 (新视频元素出现) - 增加防抖避免初始加载时误触发
+            let videoChangeTimeout = null;
+            let lastVideoElement = document.querySelector('video');
+            
+            const observer = new MutationObserver((mutations) => {
+                // 如果正在处理课程切换,跳过DOM监听触发
+                if (this._isHandlingCourseChange) {
+                    return;
+                }
+                
+                // 清除之前的定时器
+                if (videoChangeTimeout) {
+                    clearTimeout(videoChangeTimeout);
+                }
+                
+                // 增加防抖到1000ms,避免在课程切换过程中重复触发
+                videoChangeTimeout = setTimeout(() => {
+                    // 再次检查是否正在处理
+                    if (this._isHandlingCourseChange) {
+                        return;
+                    }
+                    
+                    const newVideoElement = document.querySelector('video');
+                    
+                    // 检查是否有新的video元素,或者现有video的src变化
+                    if (newVideoElement) {
+                        const videoChanged = newVideoElement !== lastVideoElement;
+                        const srcChanged = lastVideoElement && newVideoElement.src && 
+                                         lastVideoElement.src && 
+                                         newVideoElement.src !== lastVideoElement.src;
+                        
+                        if (videoChanged || srcChanged) {
+                            const reason = videoChanged ? '新video元素' : 'video src变化';
+                            Logger.log(`🎬 检测到${reason}，准备重新启动...`);
+                            lastVideoElement = newVideoElement;
+                            this.handleCourseChange();
+                        }
+                    }
+                }, 1000); // 增加到1000ms防抖
+            });
+            
+            observer.observe(document.body, {
+                childList: true,
+                subtree: true,
+                attributes: true,      // 监听属性变化
+                attributeFilter: ['src'] // 只监听src属性
+            });
+            
+            Logger.success('✅ 课程切换监听已启动');
+        }
+
+        normalizeVideoSrc(src) {
+            if (!src) return '';
+            if (src.startsWith('blob:')) {
+                return 'blob:';
+            }
+            try {
+                const url = new URL(src, window.location.origin);
+                const paramsToRemove = ['token', 'auth_key', 'ts', 'sign', 'videoKeyId', 'v', '_'];
+                paramsToRemove.forEach(key => url.searchParams.delete(key));
+                return `${url.origin}${url.pathname}`;
+            } catch (error) {
+                return src;
+            }
+        }
+
+        getCurrentCourseKey() {
+            const selectors = {
+                title: [
+                    '.yxtulcdsdk-course-player__main-title',
+                    '.yxtulcdsdk-course-player__header-title',
+                    '.yxtbiz-course-player__title',
+                    '.yxtulcdsdk-course-page__title'
+                ],
+                activeCatalog: [
+                    '.yxtulcdsdk-catalog .liactive .item-title',
+                    '.yxtulcdsdk-catalog .liactive .item',
+                    '.yxtulcdsdk-course-page__chapter-item .color-primary-6',
+                    '.yxtulcdsdk-course-page__chapter-item.color-primary-6 .yxtulcdsdk-flex-1'
+                ]
+            };
+
+            const getText = (selectorList) => {
+                for (const selector of selectorList) {
+                    const element = document.querySelector(selector);
+                    if (element && element.textContent) {
+                        const text = element.textContent.trim();
+                        if (text) return text;
+                    }
+                }
+                return '';
+            };
+
+            let courseId = '';
+            let chapterId = '';
+            try {
+                const url = new URL(window.location.href);
+                const courseParams = ['kngId', 'courseId', 'learningId', 'bizId'];
+                const chapterParams = ['chapterId', 'kngNodeId', 'childId', 'sectionId'];
+                for (const key of courseParams) {
+                    if (url.searchParams.has(key)) {
+                        courseId = url.searchParams.get(key);
+                        break;
+                    }
+                }
+                for (const key of chapterParams) {
+                    if (url.searchParams.has(key)) {
+                        chapterId = url.searchParams.get(key);
+                        break;
+                    }
+                }
+            } catch (error) {
+                Logger.debug('解析URL失败', error);
+            }
+
+            const title = getText(selectors.title);
+            const activeCatalog = getText(selectors.activeCatalog);
+            const video = document.querySelector('video');
+            const normalizedSrc = this.normalizeVideoSrc(video ? (video.currentSrc || video.src) : '');
+
+            return [courseId, chapterId, title, activeCatalog, normalizedSrc]
+                .filter(Boolean)
+                .join(' | ');
+        }
+
+        // 处理课程切换
+        async handleCourseChange() {
+            // 防抖：避免短时间内多次触发
+            if (this._courseChangeTimeout) {
+                clearTimeout(this._courseChangeTimeout);
+            }
+            
+            // 增加防抖时间到2秒,避免多个事件同时触发
+            this._courseChangeTimeout = setTimeout(async () => {
+                try {
+                    // 如果正在处理课程切换,跳过
+                    if (this._isHandlingCourseChange) {
+                        Logger.debug('🔍 正在处理课程切换,跳过重复调用');
+                        return;
+                    }
+                    
+                    this._isHandlingCourseChange = true;
+                    
+                    // 🔍 智能检测: 是否真的需要切换?
+                    const currentUrl = window.location.href;
+                    const currentVideo = document.querySelector('video');
+                    const currentVideoSrc = currentVideo ? currentVideo.src : null;
+                    const currentNormalizedSrc = this.normalizeVideoSrc(currentVideoSrc);
+                    const currentCourseKey = this.getCurrentCourseKey();
+                    
+                    // 检查URL的核心路径和关键参数
+                    const getUrlInfo = (url) => {
+                        try {
+                            const urlObj = new URL(url);
+                            // 提取pathname和关键参数(如vid, chapterId等)
+                            const pathname = urlObj.pathname;
+                            const searchParams = new URLSearchParams(urlObj.search);
+                            const vid = searchParams.get('vid') || '';
+                            const chapterId = searchParams.get('chapterId') || '';
+                            return { pathname, vid, chapterId, fullUrl: url };
+                        } catch {
+                            return { pathname: url, vid: '', chapterId: '', fullUrl: url };
+                        }
+                    };
+                    
+                    const currentInfo = getUrlInfo(currentUrl);
+                    const lastInfo = this.lastCheckedUrl ? getUrlInfo(this.lastCheckedUrl) : null;
+                    
+                    // 判断是否真正切换了课程/子课程
+                    let needReload = false;
+                    let changeReason = '';
+                    
+                    if (!lastInfo) {
+                        // 首次初始化
+                        needReload = false;
+                        changeReason = '首次初始化';
+                    } else if (currentInfo.pathname !== lastInfo.pathname) {
+                        // 情况1: 页面路径变化 (切换到不同的课程)
+                        needReload = true;
+                        changeReason = '课程路径变化';
+                    } else if (currentInfo.vid && lastInfo.vid && currentInfo.vid !== lastInfo.vid) {
+                        // 情况2: 同一课程内的子视频切换 (有子课程的情况)
+                        needReload = true;
+                        changeReason = `子视频切换 (${lastInfo.vid} → ${currentInfo.vid})`;
+                    } else if (currentInfo.chapterId && lastInfo.chapterId && currentInfo.chapterId !== lastInfo.chapterId) {
+                        // 情况3: 章节ID变化
+                        needReload = true;
+                        changeReason = '章节切换';
+                    } else if (currentNormalizedSrc && this.lastNormalizedVideoSrc && currentNormalizedSrc !== this.lastNormalizedVideoSrc) {
+                        // 情况4: 视频源URL变化 (兜底检测)
+                        needReload = true;
+                        changeReason = '视频源变化';
+                    } else if (this.lastCourseKey && currentCourseKey && currentCourseKey !== this.lastCourseKey) {
+                        needReload = true;
+                        changeReason = '课程标识变化';
+                    } else {
+                        // 情况5: 页面内部更新,不需要重启
+                        needReload = false;
+                        changeReason = '页面内部更新';
+                    }
+                    
+                    // 如果不需要重载,跳过处理
+                    if (!needReload) {
+                        Logger.debug(`🔍 ${changeReason},跳过重启`);
+                        this.lastVideoSrc = currentVideoSrc || this.lastVideoSrc;
+                        this.lastCourseKey = currentCourseKey || this.lastCourseKey;
+                        this.lastNormalizedVideoSrc = currentNormalizedSrc || this.lastNormalizedVideoSrc;
+                        this._isHandlingCourseChange = false;
+                        return;
+                    }
+                    
+                    Logger.log(`📚 检测到课程切换 (${changeReason})`);
+                    
+                    // 更新记录
+                    this.lastCheckedUrl = currentUrl;
+                    this.lastVideoSrc = currentVideoSrc;
+                    this.lastNormalizedVideoSrc = currentNormalizedSrc;
+                    this.lastCourseKey = currentCourseKey;
+                    
+                    // 1. 停止当前播放并重置状态
+                    this.stop();
+                    
+                    // 2. 等待新内容加载 (增加到3秒,确保视频播放器初始化完成)
+                    Logger.log('⏳ 等待新视频加载...');
+                    await this.sleep(3000);
+                    
+                    // 3. 重新检测内容类型
+                    this.detectContentType();
+                    
+                    // 4. 重新初始化控制器
+                    if (this.contentType === 'video') {
+                        this.videoController = new VideoController(this.stateManager, this);
+                        Logger.log('🎥 重新初始化视频控制器');
+                    } else if (this.contentType === 'pdf') {
+                        this.pdfController = new PDFController(this.stateManager);
+                        Logger.log('📄 重新初始化PDF控制器');
+                    }
+                    
+                    // 5. 如果配置自动开始，则自动启动
+                    if (CONFIG.autoStart) {
+                        Logger.log('🚀 自动重启播放...');
+                        await this.sleep(1000);
+                        await this.start();
+                    }
+                    
+                    Logger.success('✅ 课程切换处理完成');
+                    this._isHandlingCourseChange = false;
+                } catch (error) {
+                    Logger.error('❌ 课程切换处理失败:', error);
+                    this._isHandlingCourseChange = false;
+                }
+            }, 2000); // 增加到2秒防抖
         }
 
         // 检测内容类型
@@ -1483,6 +2326,23 @@
         async startVideoPlaying() {
             Logger.log('启动视频自动播放...');
             
+            // 🔄 立即更新UI状态 (显示正在加载)
+            const statusDiv = document.getElementById('famsun-auto-status');
+            if (statusDiv) {
+                statusDiv.innerHTML = `
+                    <div style="font-size: 13px; color: #4CAF50; text-align: center;">
+                        🎬 正在加载视频播放器...
+                    </div>
+                `;
+            }
+            
+            if (this.videoController) {
+                this.videoController.durationFallback = false;
+                this.videoController.durationWarningShown = false;
+                this.videoController.metadataListenerBound = false;
+                this.videoController.metadataReady = false;
+            }
+
             // 查找播放器
             let attempts = 0;
             const maxAttempts = 15; // 增加尝试次数
@@ -1495,6 +2355,14 @@
 
             if (!this.videoController.player && !this.videoController.videoElement) {
                 Logger.error('未找到视频播放器，请检查页面或手动点击开始学习按钮');
+                // 更新UI显示错误
+                if (statusDiv) {
+                    statusDiv.innerHTML = `
+                        <div style="font-size: 13px; color: #f44336; text-align: center;">
+                            ❌ 未找到视频播放器
+                        </div>
+                    `;
+                }
                 return;
             }
 
@@ -1520,6 +2388,16 @@
 
         async clickStartButton() {
             Logger.log('查找开始学习/继续学习按钮...');
+            
+            // 🔍 优化: 如果已经检测到视频播放器或PDF,跳过按钮查找
+            const hasVideo = document.querySelector('video') !== null;
+            const hasCyberPlayer = window.cyberplayer !== undefined;
+            const hasPDF = document.querySelector('.yxtulcdsdk-course-player__pdfreader') !== null;
+            
+            if (hasVideo || hasCyberPlayer || hasPDF) {
+                Logger.log('✅ 检测到内容已加载(视频/PDF),跳过按钮查找');
+                return false; // 返回false表示没有点击按钮,但不是错误
+            }
             
             // 定义按钮选择器和关键词（优先级从高到低）
             const buttonSelectors = [
@@ -1624,7 +2502,7 @@
         }
 
         stop() {
-            Logger.log('停止自动播放');
+            Logger.log('🛑 停止自动播放');
             
             // 停止视频播放
             if (this.videoController) {
@@ -1637,7 +2515,46 @@
                 this.pdfController.destroy();
             }
             
+            // 重置状态
             this.stateManager.setState({ isRunning: false });
+            
+            // 🔄 清空UI面板显示 (避免显示旧视频的进度信息)
+            this.resetUIPanel();
+            
+            Logger.log('✅ 已停止');
+        }
+        
+        // 重置UI面板显示
+        resetUIPanel() {
+            const statusDiv = document.getElementById('famsun-auto-status');
+            if (statusDiv) {
+                statusDiv.innerHTML = `
+                    <div style="font-size: 13px; color: #FFD700; text-align: center;">
+                        🔄 准备加载新课程...
+                    </div>
+                `;
+            }
+        }
+
+        // 清理所有资源
+        destroy() {
+            Logger.log('🗑️ 清理资源...');
+            
+            // 停止播放
+            this.stop();
+            
+            // 停止URL检查
+            if (this.urlCheckInterval) {
+                clearInterval(this.urlCheckInterval);
+                this.urlCheckInterval = null;
+            }
+            
+            // 清理反检测
+            if (this.antiDetection) {
+                this.antiDetection.destroy();
+            }
+            
+            Logger.log('✅ 资源清理完成');
         }
 
         sleep(ms) {
