@@ -8,6 +8,7 @@
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_registerMenuCommand
+// @grant        GM_setClipboard
 // @grant        unsafeWindow
 // @run-at       document-end
 // ==/UserScript==
@@ -1735,6 +1736,365 @@
         }
     }
 
+    // ==================== 考试控制模块 ====================
+    class ExamController {
+        constructor(autoPlayer) {
+            this.autoPlayer = autoPlayer;
+            this.questions = [];
+            this.questionMap = new Map();
+            this.sources = new Set();
+            this.isActive = false;
+            this.lastStatus = '';
+        }
+
+        static installGlobalInterceptors() {
+            if (ExamController._interceptorsInstalled) {
+                return;
+            }
+
+            const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+
+            if (pageWindow.fetch) {
+                const originalFetch = pageWindow.fetch;
+                pageWindow.fetch = function(...args) {
+                    return originalFetch.apply(this, args).then(response => {
+                        try {
+                            ExamController.dispatchFetch(args, response);
+                        } catch (error) {
+                            Logger.debug('考试模块拦截fetch失败', error);
+                        }
+                        return response;
+                    });
+                };
+            }
+
+            if (pageWindow.XMLHttpRequest) {
+                const XMLHttpRequestPrototype = pageWindow.XMLHttpRequest.prototype;
+                const originalOpen = XMLHttpRequestPrototype.open;
+                const originalSend = XMLHttpRequestPrototype.send;
+
+                XMLHttpRequestPrototype.open = function(method, url, async, user, password) {
+                    this.__examInterceptUrl = url;
+                    return originalOpen.apply(this, arguments);
+                };
+
+                XMLHttpRequestPrototype.send = function(body) {
+                    this.addEventListener('load', function() {
+                        try {
+                            const controller = ExamController.activeController;
+                            if (!controller) return;
+                            const responseType = this.responseType || '';
+                            if (responseType && responseType !== 'json' && responseType !== 'text') return;
+                            const url = this.__examInterceptUrl;
+                            if (!controller.shouldHandleUrl(url)) return;
+                            const text = this.responseText;
+                            if (!text) return;
+                            controller.handleNetworkPayload(url, text);
+                        } catch (error) {
+                            Logger.debug('考试模块拦截XHR失败', error);
+                        }
+                    });
+                    return originalSend.apply(this, arguments);
+                };
+            }
+
+            ExamController._interceptorsInstalled = true;
+            Logger.log('考试模块网络拦截器已安装');
+        }
+
+        static dispatchFetch(args, response) {
+            if (!ExamController.activeController) return;
+            try {
+                const controller = ExamController.activeController;
+                const request = args[0];
+                const url = typeof request === 'string' ? request : (request && request.url);
+                if (!url || !controller.shouldHandleUrl(url)) return;
+                const cloned = response.clone();
+                cloned.text().then(text => {
+                    controller.handleNetworkPayload(url, text);
+                }).catch(() => {});
+            } catch (error) {
+                Logger.debug('考试模块处理fetch响应异常', error);
+            }
+        }
+
+        start() {
+            ExamController.installGlobalInterceptors();
+            ExamController.activeController = this;
+            this.isActive = true;
+            this.questions = [];
+            this.questionMap.clear();
+            this.sources.clear();
+            this.updatePanel('正在监听考试接口...');
+            Logger.log('考试模块已启动，等待捕获考题数据');
+        }
+
+        stop() {
+            if (ExamController.activeController === this) {
+                ExamController.activeController = null;
+            }
+            this.isActive = false;
+            this.updatePanel(null);
+        }
+
+        resetForNewExam() {
+            this.questions = [];
+            this.questionMap.clear();
+            this.sources.clear();
+            if (this.isActive) {
+                this.updatePanel('检测到新考试，正在重新监听...');
+            }
+        }
+
+        handleNetworkPayload(url, rawText) {
+            if (!this.isActive) return;
+            if (!this.shouldHandleUrl(url)) return;
+            if (!rawText) return;
+
+            let data;
+            try {
+                data = JSON.parse(rawText);
+            } catch (error) {
+                return;
+            }
+
+            this.processResponse(url, data);
+        }
+
+        shouldHandleUrl(url) {
+            if (!url) return false;
+            const lower = String(url).toLowerCase();
+            return lower.includes('/ote/') || lower.includes('exam') || lower.includes('paper') || lower.includes('practice');
+        }
+
+        processResponse(url, data) {
+            if (!data) return;
+            const extracted = this.extractQuestions(data);
+            if (!extracted.length) return;
+
+            let added = 0;
+            for (const question of extracted) {
+                if (!question.idKey) continue;
+                if (!this.questionMap.has(question.idKey)) {
+                    this.questionMap.set(question.idKey, question);
+                    this.questions.push(question);
+                    added++;
+                }
+            }
+
+            if (!added) return;
+
+            this.sources.add(url);
+            Logger.success(`考试模块捕获 ${added} 道新题 (累计 ${this.questions.length})`);
+            this.updatePanel(`已捕获 ${this.questions.length} 题，来自 ${this.sources.size} 个接口`);
+        }
+
+        extractQuestions(root) {
+            const results = [];
+            const visited = typeof WeakSet !== 'undefined' ? new WeakSet() : new Set();
+
+            const walk = (node) => {
+                if (!node || typeof node !== 'object') return;
+                if (visited.has(node)) return;
+                visited.add(node);
+
+                const normalized = this.normalizeQuestion(node);
+                if (normalized) {
+                    results.push(normalized);
+                    return;
+                }
+
+                if (Array.isArray(node)) {
+                    node.forEach(item => walk(item));
+                    return;
+                }
+
+                const nestedKeys = ['data', 'result', 'payload', 'content', 'body'];
+                for (const key of nestedKeys) {
+                    if (node[key] && typeof node[key] === 'object') {
+                        walk(node[key]);
+                    }
+                }
+
+                Object.keys(node).forEach(key => {
+                    const value = node[key];
+                    if (value && typeof value === 'object') {
+                        walk(value);
+                    }
+                });
+            };
+
+            walk(root);
+            return results;
+        }
+
+        normalizeQuestion(raw) {
+            if (!raw || typeof raw !== 'object') return null;
+
+            const titleValue = this.getFirstProperty(raw, ['questionTitle', 'title', 'stem', 'content', 'topic', 'subject', 'name', 'questionName', 'questionStem']);
+            if (!titleValue) return null;
+
+            const idValue = this.getFirstProperty(raw, ['questionId', 'id', 'itemId', 'topicId', 'subjectId', 'paperItemId']);
+            const typeValue = this.getFirstProperty(raw, ['questionTypeName', 'questionType', 'typeName', 'type', 'questionCategory']);
+            const answerValue = this.getFirstProperty(raw, ['answer', 'rightAnswer', 'correctAnswer', 'standardAnswer', 'correctOption', 'answerKeys', 'answerKey', 'answers']);
+            const analysisValue = this.getFirstProperty(raw, ['analysis', 'explain', 'analysisContent', 'solution', 'answerAnalysis']);
+
+            const options = this.normalizeOptions(raw);
+            const title = this.cleanText(titleValue);
+            if (!title) return null;
+
+            const answer = this.formatAnswer(answerValue, options);
+            const analysis = this.cleanText(analysisValue);
+
+            const idKeyBase = (idValue || title).toString();
+            const idKey = `${idKeyBase}_${typeValue || 'default'}`;
+
+            return {
+                id: idValue || idKeyBase,
+                idKey,
+                type: this.cleanText(typeValue),
+                title,
+                options,
+                answer,
+                analysis,
+                raw
+            };
+        }
+
+        normalizeOptions(raw) {
+            let options = this.getFirstProperty(raw, ['optionList', 'options', 'optionVos', 'optionVOList', 'optionDtoList', 'answerOptions', 'optionItems', 'choiceList', 'opts', 'optionDetails']);
+            if (!options) {
+                const optionMap = this.getFirstProperty(raw, ['optionMap', 'optionsMap', 'optionDict']);
+                if (optionMap && typeof optionMap === 'object' && !Array.isArray(optionMap)) {
+                    options = Object.entries(optionMap).map(([label, text]) => ({ option: label, content: text }));
+                }
+            }
+
+            if (!options) return [];
+
+            if (!Array.isArray(options) && typeof options === 'object') {
+                options = Object.entries(options).map(([label, text]) => ({ option: label, content: text }));
+            }
+
+            if (!Array.isArray(options)) return [];
+
+            return options.map((item, index) => {
+                const label = this.cleanText(this.getFirstProperty(item, ['option', 'optionLabel', 'label', 'code', 'identifier', 'optionNo', 'optionCode'])) || String.fromCharCode(65 + index);
+                const text = this.cleanText(this.getFirstProperty(item, ['content', 'optionContent', 'text', 'title', 'optionText', 'name', 'value', 'answerText', 'description']) || item[label] || '');
+                const correctRaw = this.getFirstProperty(item, ['isCorrect', 'correct', 'right', 'isRight', 'isAnswer', 'answer', 'trueAnswer', 'standardAnswer']);
+                const correct = this.toBoolean(correctRaw);
+                return { label, text, isCorrect: correct };
+            }).filter(option => option.text || option.label);
+        }
+
+        getFirstProperty(obj, keys) {
+            if (!obj) return null;
+            for (const key of keys) {
+                if (!Object.prototype.hasOwnProperty.call(obj, key)) continue;
+                const value = obj[key];
+                if (value === null || value === undefined) continue;
+                if (typeof value === 'string' && value.trim() === '') continue;
+                if (Array.isArray(value) && value.length === 0) continue;
+                return value;
+            }
+            return null;
+        }
+
+        toBoolean(value) {
+            if (typeof value === 'boolean') return value;
+            if (value === null || value === undefined) return false;
+            const normalized = String(value).trim().toLowerCase();
+            if (!normalized) return false;
+            return ['1', 'true', 'y', 'yes', '正确', '是'].includes(normalized);
+        }
+
+        cleanText(value) {
+            if (value === null || value === undefined) return '';
+            if (Array.isArray(value)) {
+                return value.map(v => this.cleanText(v)).filter(Boolean).join(' / ');
+            }
+            if (typeof value === 'number') {
+                return String(value);
+            }
+            if (typeof value !== 'string') {
+                try {
+                    return JSON.stringify(value);
+                } catch (error) {
+                    return '';
+                }
+            }
+            return value
+                .replace(/<\s*br\s*\/?\s*>/gi, '\n')
+                .replace(/<[^>]+>/g, '')
+                .replace(/\r/gi, '')
+                .replace(/\u00a0/g, ' ')
+                .replace(/\s+\n/g, '\n')
+                .replace(/\n{3,}/g, '\n\n')
+                .trim();
+        }
+
+        formatAnswer(rawAnswer, options) {
+            const answer = this.cleanText(rawAnswer);
+            if (answer) return answer;
+            if (!options || !options.length) return '';
+            const correctOptions = options.filter(opt => opt.isCorrect);
+            if (!correctOptions.length) return '';
+            return correctOptions.map(opt => opt.label).join(', ');
+        }
+
+        updatePanel(statusText) {
+            this.lastStatus = statusText || '';
+            if (!this.autoPlayer || !this.autoPlayer.controlPanel) return;
+            this.autoPlayer.controlPanel.updateExamInfo({
+                visible: this.isActive,
+                statusText: statusText || (this.questions.length ? `已捕获 ${this.questions.length} 题` : '等待考试接口...'),
+                total: this.questions.length,
+                sourceCount: this.sources.size
+            });
+        }
+
+        copyQuestionsToClipboard() {
+            if (!this.questions.length) {
+                Logger.warn('考试模块尚未捕获到考题');
+                return false;
+            }
+
+            const content = this.formatQuestionsForExport();
+            try {
+                GM_setClipboard(content, { type: 'text', mimetype: 'text/plain' });
+                Logger.success(`已复制 ${this.questions.length} 道考题到剪贴板`);
+                return true;
+            } catch (error) {
+                Logger.error('复制考题失败', error);
+                return false;
+            }
+        }
+
+        formatQuestionsForExport() {
+            return this.questions.map((question, index) => {
+                const lines = [];
+                const header = `${index + 1}. ${question.title}${question.type ? ` (${question.type})` : ''}`;
+                lines.push(header);
+                if (question.options && question.options.length) {
+                    question.options.forEach(option => {
+                        const suffix = option.isCorrect ? ' ✅' : '';
+                        lines.push(`    ${option.label}. ${option.text}${suffix}`);
+                    });
+                }
+                if (question.answer) {
+                    lines.push(`    答案：${question.answer}`);
+                }
+                if (question.analysis) {
+                    lines.push(`    解析：${question.analysis}`);
+                }
+                return lines.join('\n');
+            }).join('\n\n');
+        }
+    }
+
+    ExamController._interceptorsInstalled = false;
+    ExamController.activeController = null;
+
     // ==================== UI控制面板 ====================
     class ControlPanel {
         constructor(autoPlayer) {
@@ -1788,6 +2148,28 @@
                         ">
                             等待视频加载...
                         </div>
+                        <div id="famsun-exam-section" style="
+                            display: none;
+                            background: rgba(255,255,255,0.1);
+                            padding: 10px;
+                            border-radius: 5px;
+                            margin-bottom: 10px;
+                            font-size: 12px;
+                        ">
+                            <div style="font-weight: bold; margin-bottom: 6px;">📝 考试模式</div>
+                            <div id="famsun-exam-status-text" style="margin-bottom: 4px;">正在监听考试接口...</div>
+                            <div id="famsun-exam-count" style="margin-bottom: 8px;">累计 0 题</div>
+                            <button id="famsun-exam-copy" style="
+                                width: 100%;
+                                border: none;
+                                background: rgba(255,255,255,0.25);
+                                color: white;
+                                padding: 6px 0;
+                                border-radius: 4px;
+                                cursor: pointer;
+                                font-size: 12px;
+                            ">复制考题到剪贴板</button>
+                        </div>
                         <div style="font-size: 12px;">
                             <label style="display: flex; align-items: center;">
                                 <input type="checkbox" id="famsun-auto-next" checked style="margin-right: 5px;">
@@ -1824,6 +2206,20 @@
                 CONFIG.autoNext = e.target.checked;
                 GM_setValue('autoNext', CONFIG.autoNext);
             });
+
+            const copyButton = document.getElementById('famsun-exam-copy');
+            if (copyButton) {
+                copyButton.addEventListener('click', () => {
+                    if (this.autoPlayer && this.autoPlayer.examController) {
+                        const success = this.autoPlayer.examController.copyQuestionsToClipboard();
+                        if (!success) {
+                            alert('暂无可复制的考题，请等待考试数据加载。');
+                        }
+                    } else {
+                        alert('考试模块尚未准备好，请先进入考试页面。');
+                    }
+                });
+            }
         }
 
         // 同步UI显示
@@ -1831,6 +2227,31 @@
             const autoNextCheckbox = document.getElementById('famsun-auto-next');
             if (autoNextCheckbox) {
                 autoNextCheckbox.checked = CONFIG.autoNext;
+            }
+        }
+
+        updateExamInfo({ visible, statusText, total, sourceCount }) {
+            const section = document.getElementById('famsun-exam-section');
+            if (!section) return;
+
+            if (!visible) {
+                section.style.display = 'none';
+                return;
+            }
+
+            section.style.display = 'block';
+
+            const statusEl = document.getElementById('famsun-exam-status-text');
+            const countEl = document.getElementById('famsun-exam-count');
+
+            if (statusEl) {
+                statusEl.textContent = statusText || '';
+            }
+
+            if (countEl) {
+                const totalCount = typeof total === 'number' ? total : 0;
+                const sourceInfo = sourceCount ? `（接口 ${sourceCount} 个）` : '';
+                countEl.textContent = `累计 ${totalCount} 题${sourceInfo}`;
             }
         }
     }
@@ -1842,8 +2263,9 @@
             this.antiDetection = null;
             this.videoController = null;
             this.pdfController = null;
+            this.examController = null;
             this.controlPanel = null;
-            this.contentType = null; // 'video' or 'pdf'
+            this.contentType = null; // 'video' | 'pdf' | 'exam'
             this.currentCourseUrl = null; // 当前课程URL
             this.lastCheckedUrl = null; // 上次检查的URL (用于智能过滤)
             this.lastVideoSrc = null; // 上次视频源 (用于智能过滤)
@@ -1870,6 +2292,8 @@
                 this.videoController = new VideoController(this.stateManager, this);
             } else if (this.contentType === 'pdf') {
                 this.pdfController = new PDFController(this.stateManager);
+            } else if (this.contentType === 'exam') {
+                this.examController = new ExamController(this);
             }
 
             // 初始化控制面板
@@ -2168,6 +2592,13 @@
                     } else if (this.contentType === 'pdf') {
                         this.pdfController = new PDFController(this.stateManager);
                         Logger.log('📄 重新初始化PDF控制器');
+                    } else if (this.contentType === 'exam') {
+                        if (!this.examController) {
+                            this.examController = new ExamController(this);
+                        } else {
+                            this.examController.resetForNewExam();
+                        }
+                        Logger.log('📝 重新初始化考试控制器');
                     }
                     
                     // 5. 如果配置自动开始，则自动启动
@@ -2188,6 +2619,13 @@
 
         // 检测内容类型
         detectContentType() {
+            const currentUrl = window.location.href;
+            if (/\/ote\//i.test(currentUrl) || document.querySelector('#oteApp') || document.querySelector('#ote-app') || document.querySelector('[class*="ote-exam"]')) {
+                this.contentType = 'exam';
+                Logger.log('检测到考试页面');
+                return;
+            }
+
             // 检测是否为PDF页面
             const pdfIndicators = [
                 '.yxtbiz-doc-player',
@@ -2277,11 +2715,14 @@
             
             Logger.log('开始自动学习...');
             
-            // 第一步: 尝试点击"开始学习"或"继续学习"按钮
-            const startButtonClicked = await this.clickStartButton();
-            if (startButtonClicked) {
-                Logger.success('已点击开始学习按钮，等待内容加载...');
-                await this.sleep(2000); // 等待内容加载
+            if (this.contentType !== 'exam') {
+                const startButtonClicked = await this.clickStartButton();
+                if (startButtonClicked) {
+                    Logger.success('已点击开始学习按钮，等待内容加载...');
+                    await this.sleep(2000); // 等待内容加载
+                }
+            } else {
+                Logger.log('考试页面跳过自动点击开始按钮');
             }
             
             // 重新检测内容类型(因为内容是动态加载的)
@@ -2290,19 +2731,44 @@
             
             // 如果内容类型改变,重新初始化对应的控制器
             if (this.contentType !== oldContentType) {
-                if (this.contentType === 'video' && !this.videoController) {
+                if (this.contentType === 'video') {
                     this.videoController = new VideoController(this.stateManager, this);
-                } else if (this.contentType === 'pdf' && !this.pdfController) {
+                } else if (this.contentType === 'pdf') {
                     this.pdfController = new PDFController(this.stateManager);
+                } else if (this.contentType === 'exam') {
+                    this.examController = new ExamController(this);
                 }
+            }
+
+            if (this.contentType === 'exam' && !this.examController) {
+                this.examController = new ExamController(this);
             }
             
             // 根据内容类型选择不同的处理方式
-            if (this.contentType === 'pdf') {
+            if (this.contentType === 'exam') {
+                await this.startExamMode();
+            } else if (this.contentType === 'pdf') {
                 await this.startPDFReading();
             } else {
                 await this.startVideoPlaying();
             }
+        }
+
+        async startExamMode() {
+            Logger.log('启动考试考题捕获...');
+
+            if (!this.examController) {
+                this.examController = new ExamController(this);
+            } else {
+                this.examController.resetForNewExam();
+            }
+
+            this.examController.start();
+            this.stateManager.setState({
+                isRunning: true,
+                startTime: Date.now()
+            });
+            Logger.success('考试模块已启动');
         }
 
         // 启动PDF阅读
@@ -2514,6 +2980,10 @@
             if (this.pdfController) {
                 this.pdfController.destroy();
             }
+
+            if (this.examController) {
+                this.examController.stop();
+            }
             
             // 重置状态
             this.stateManager.setState({ isRunning: false });
@@ -2533,6 +3003,11 @@
                         🔄 准备加载新课程...
                     </div>
                 `;
+            }
+
+            const examSection = document.getElementById('famsun-exam-section');
+            if (examSection) {
+                examSection.style.display = 'none';
             }
         }
 
@@ -2572,6 +3047,17 @@
                 CONFIG.debugMode = !CONFIG.debugMode;
                 GM_setValue('debugMode', CONFIG.debugMode);
                 alert(`调试模式已${CONFIG.debugMode ? '启用' : '禁用'}`);
+            });
+
+            GM_registerMenuCommand('📋 复制考试考题', () => {
+                if (!this.examController) {
+                    alert('考试模块尚未启动，请在考试页面使用此功能。');
+                    return;
+                }
+                const success = this.examController.copyQuestionsToClipboard();
+                if (!success) {
+                    alert('暂无可复制的考题，请等待考试数据加载后重试。');
+                }
             });
         }
     }
