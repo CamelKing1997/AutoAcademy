@@ -99,53 +99,186 @@ GM_getValue('pdfScrollStep', 500)       // PDF scroll distance (pixels)
 ## How It Works
 
 ### Video Playback Flow
-```
-1. User navigates to video course
-   ↓
-2. Script detects video element (JW Player / CyberPlayer / VideoJS / Native)
-   ↓
-3. Script sets playback speed to 2x
-   ↓
-4. Video plays automatically
-   ↓
-5. System countdown timer is monitored
-   ↓
-6. If countdown > 0: Maintain playback, prevent auto-jump
-   ↓
-7. When countdown = 0 OR countdown panel disappears: Mark complete
-   ↓
-8. Auto-jump to next course (if autoNext enabled)
-   ↓
-9. Repeat
+
+```mermaid
+graph TD
+    A["👤 User enters course page"] --> B["🔍 Detect content type<br/>Video/PDF"]
+    B --> C{Content<br/>Type?}
+    C -->|Video| D["🎬 Find video player<br/>JW/Cyber/VideoJS/Native"]
+    C -->|PDF| E["📄 Initialize PDF controller"]
+    D --> F["⚙️ Set playback speed to 2x"]
+    F --> G["▶️ Start video playback"]
+    E --> H["📜 Start auto-scrolling PDF"]
+    G --> I["⏱️ Monitor system countdown"]
+    H --> J["⏱️ Monitor system countdown"]
+    I --> K{Countdown > 0?}
+    J --> K
+    K -->|Yes| L["🔄 Keep playback active<br/>Rewind if stopped"]
+    K -->|No| M["✅ Mark course complete"]
+    L --> N{Countdown<br/>reached zero?}
+    N -->|No| L
+    N -->|Yes| M
+    M --> O{Auto-next<br/>enabled?}
+    O -->|Yes| P["🔗 Jump to next course"]
+    O -->|No| Q["🛑 Stop"]
+    P --> A
+    Q --> Q
 ```
 
 ### Countdown Management
-```
-Video ends but countdown remains (e.g., 2:30):
-  ↓
-Script detects playback stopped + countdown active
-  ↓
-Script rewinds video to ~1% and resumes playback
-  ↓
-Every 8 seconds, checks if video stopped again
-  ↓
-Repeats until countdown reaches 0 or panel disappears
-  ↓
-Then auto-jumps to next course
+
+```mermaid
+graph TD
+    A["🎬 Video ends"] --> B["⏱️ System countdown<br/>still active<br/>e.g., 2:30"]
+    B --> C["📊 Monitor every 1 second"]
+    C --> D{Video<br/>stopped?}
+    D -->|Yes| E["⏪ Rewind to ~1%"]
+    D -->|No| F["✓ Continue playing"]
+    E --> G["⏱️ Check cooldown<br/>8 seconds"]
+    G --> H{Cooldown<br/>expired?}
+    H -->|Yes| I["▶️ Resume playback"]
+    H -->|No| J["⏸️ Wait for cooldown"]
+    I --> K{Countdown = 0 or<br/>panel disappeared?}
+    J --> K
+    F --> K
+    K -->|Yes| L["✅ Complete course"]
+    K -->|No| M["🔄 Continue monitoring"]
+    M --> D
+    L --> N["🔗 Auto-jump to next"]
 ```
 
-### Course Detection
-The script detects course changes via:
-1. **URL Changes**: Different pathname or query parameters (courseId, chapterId, etc.)
-2. **Navigation Events**: history.pushState/replaceState/popstate
-3. **DOM Mutations**: New video elements or changed src attributes
-4. **Video Source Changes**: Different video src URLs after normalization
+### Course Detection Mechanism
 
-When a course change is detected:
-- Current playback is stopped
-- 3 seconds wait for new page to load
-- New course controller is initialized
-- Auto-start begins if enabled
+```mermaid
+graph TD
+    A["📍 Page Change Detected"] --> B{Detection<br/>Source?}
+    B -->|URL Path Changed| C["🔄 Pathname differs"]
+    B -->|pushState/replaceState| D["🔄 Navigation event"]
+    B -->|popstate| E["🔄 Browser back/forward"]
+    B -->|Video Element| F["🔄 New video element"]
+    B -->|Video Source| G["🔄 Different src URL"]
+    C --> H["🔍 Validate real change<br/>Compare normalized URLs<br/>& course IDs"]
+    D --> H
+    E --> H
+    F --> H
+    G --> H
+    H --> I{Is this a<br/>real course<br/>switch?}
+    I -->|No| J["⏭️ Skip - internal update"]
+    I -->|Yes| K["🛑 Stop current playback"]
+    K --> L["⏳ Wait 3 seconds<br/>for new page load"]
+    L --> M["🔄 Detect new content type"]
+    M --> N["⚙️ Initialize new controller"]
+    N --> O{Auto-start<br/>enabled?}
+    O -->|Yes| P["🚀 Auto-play new course"]
+    O -->|No| Q["⏸️ Waiting for user"]
+    P --> R["✅ Course switch complete"]
+    Q --> R
+    J --> S["✓ Continue current course"]
+```
+
+### Multi-Player Detection & Speed Control
+
+```mermaid
+graph TD
+    A["🎯 Detect Player Type"] --> B{Check<br/>players}
+    B -->|JW Player container| C["✅ JW Player found"]
+    B -->|cyberplayer object| D["✅ CyberPlayer found"]
+    B -->|videojs instance| E["✅ VideoJS found"]
+    B -->|Petrel marker| F["✅ Petrel found"]
+    B -->|video element| G["✅ Native HTML5"]
+    C --> H["⚙️ Set 2x Speed"]
+    D --> H
+    E --> H
+    F --> H
+    G --> H
+    H --> I["📊 Try multiple methods"]
+    I --> J["Method 1: UI Click<br/>Most reliable"]
+    I --> K["Method 2: Player API<br/>setPlaybackRate"]
+    I --> L["Method 3: Video element<br/>playbackRate property"]
+    I --> M["Method 4: Global object<br/>window.cyberplayer"]
+    J --> N{Speed<br/>set?}
+    K --> N
+    L --> N
+    M --> N
+    N -->|Yes| O["✅ Verify speed"]
+    N -->|No| P["🔄 Retry up to 3x"]
+    P --> N
+    O --> Q{Actual speed<br/>≈ 2x?}
+    Q -->|Yes| R["✅ Success!"]
+    Q -->|No| S["⚠️ Warning: Speed mismatch"]
+```
+
+### System Architecture
+
+```mermaid
+graph LR
+    subgraph "Tampermonkey Runtime"
+        A["AutoPlayer<br/>Main Controller"]
+    end
+    
+    subgraph "Detection & Monitoring"
+        B["StateManager<br/>State Storage"]
+        C["AntiDetection<br/>Prevent Detection"]
+    end
+    
+    subgraph "Content Controllers"
+        D["VideoController<br/>Video Playback"]
+        E["PDFController<br/>PDF Reading"]
+    end
+    
+    subgraph "UI Components"
+        F["ControlPanel<br/>Dashboard"]
+    end
+    
+    subgraph "Player Support"
+        G["JW Player"]
+        H["CyberPlayer"]
+        I["VideoJS"]
+        J["Petrel/Native"]
+    end
+    
+    A --> B
+    A --> C
+    A --> D
+    A --> E
+    A --> F
+    D --> G
+    D --> H
+    D --> I
+    D --> J
+    F -.->|Displays Status| D
+    F -.->|Displays Status| E
+    C -.->|Anti-Detection| A
+    B -.->|Stores State| A
+```
+
+### Countdown State Machine
+
+```mermaid
+stateDiagram-v2
+    [*] --> NoCountdown: Initial State
+    
+    NoCountdown --> FirstSeen: Countdown detected<br/>lastCountdownSeconds = value
+    
+    FirstSeen --> Armed: Countdown ≤ 30s<br/>countdownArmed = true
+    FirstSeen --> FirstSeen: Countdown > 30s<br/>Keep monitoring
+    
+    Armed --> Armed: 30s < countdown < 0<br/>ensureCountdownActive()<br/>checks every 1s
+    
+    Armed --> Parsing: Countdown updated<br/>re-parse seconds
+    
+    Parsing --> Armed: Still active
+    
+    Armed --> PanelGone: Countdown panel<br/>disappeared
+    
+    Armed --> Complete: Countdown ≤ 3s<br/>countdownEverSeen = true
+    
+    PanelGone --> Complete: Course marked<br/>complete
+    
+    Complete --> Done: resetCountdownState()<br/>Clear all flags
+    
+    Done --> [*]: Next course<br/>or idle
+```
 
 ## Troubleshooting
 
