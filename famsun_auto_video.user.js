@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         FAMSUN Academy 视频自动播放助手
 // @namespace    http://tampermonkey.net/
-// @version      1.3.5
-// @description  自动播放FAMSUN Academy视频并满足观看时长要求 (v1.3.5: 修复UI速度显示同步问题)
+// @version      1.3.10
+// @description  自动播放FAMSUN Academy视频并满足观看时长要求 (v1.3.10: 增强按钮检测 + 添加重试机制)
 // @author       AutoAcademy
 // @match        https://academy.famsungroup.com/*
 // @grant        GM_setValue
@@ -440,9 +440,17 @@
                     retryCount++;
                     if (retryCount <= maxRetries) {
                         Logger.debug(`等待视频加载... (${retryCount}/${maxRetries})`);
-                        // 尝试重新获取 video 元素
+                        // 尝试重新获取 video 元素,支持Petrel播放器
                         if (!this.videoElement) {
-                            this.videoElement = document.querySelector('video');
+                            // 优先检测Petrel播放器
+                            this.videoElement = document.querySelector('.petrel-smart-player-m3u8-track video') ||
+                                               document.querySelector('.petrel-player video') ||
+                                               document.querySelector('video');
+                            
+                            if (this.videoElement && this.videoElement.closest('.petrel-player')) {
+                                Logger.info('检测到Petrel播放器(海燕播放器)');
+                                this.playerType = 'petrel';
+                            }
                         }
                         return;
                     } else if (retryCount === maxRetries + 1) {
@@ -454,6 +462,9 @@
                 // 成功获取到时长
                 if (retryCount > 0 && retryCount <= maxRetries) {
                     Logger.success(`成功获取视频信息 (时长: ${this.formatTime(duration)})`);
+                    if (this.playerType === 'petrel') {
+                        Logger.info('🐦 使用Petrel播放器模式');
+                    }
                     retryCount = 0;
                 }
                 
@@ -497,14 +508,79 @@
 
                 const text = element.textContent || '';
                 
-                // 必须先检查倒计时,避免误判
-                const match = text.match(/还需\s*.*?(\d+)\s*分钟\s*(\d+)\s*秒/);
-                if (match) {
-                    const minutes = parseInt(match[1]);
-                    const seconds = parseInt(match[2]);
-                    const totalSeconds = minutes * 60 + seconds;
-                    Logger.debug(`系统倒计时: ${minutes}分${seconds}秒 (剩余${totalSeconds}秒)`);
+                // 特殊处理: PDF课件的完成提示("需完成课程内容,才能获得X学分")
+                // 这种情况下没有倒计时,只要能看到这个文本就说明内容已经展示完毕
+                if (/需完成课程内容/.test(text) && /学分/.test(text)) {
+                    // PDF课件: 检查是否有"下一个"按钮出现(表示当前课程已完成)
+                    const nextButton = document.querySelector('.ulcdsdk-nextchapterbutton');
+                    if (nextButton && nextButton.offsetParent !== null) {
+                        Logger.success('PDF课件: 检测到"下一个"按钮,课程已完成');
+                        return true;
+                    }
                     
+                    // PDF课件: 检查课程目录中当前课程的完成状态
+                    const currentCourse = document.querySelector('.yxtulcdsdk-catalog .liactive');
+                    if (currentCourse) {
+                        const completionIcon = currentCourse.querySelector('svg path[stroke="#FFF"]');
+                        if (completionIcon) {
+                            Logger.success('PDF课件: 课程目录显示已完成');
+                            return true;
+                        }
+                    }
+                    
+                    Logger.debug('PDF课件: 等待完成标记...');
+                    return false; // PDF课件需要等待完成标记
+                }
+                
+                // 必须先检查倒计时,避免误判
+                // 适配多种格式: 
+                // 1. "还需 2小时 2分钟 58秒" (小时+分钟+秒)
+                // 2. "还需 2小时 4秒" (小时+秒,无分钟)
+                // 3. "还需 7分钟 30秒" 或 "还需 7分 30秒" (分钟+秒)
+                // 4. "还需 22秒" (只有秒数)
+                let totalSeconds = 0;
+                let hours = 0;
+                let minutes = 0;
+                let seconds = 0;
+                
+                // 优先匹配: 小时+分钟+秒 格式
+                let match = text.match(/还需\s*(\d+)\s*小时\s*(\d+)\s*分(?:钟)?\s*(\d+)\s*秒/);
+                if (match) {
+                    hours = parseInt(match[1]);
+                    minutes = parseInt(match[2]);
+                    seconds = parseInt(match[3]);
+                    totalSeconds = hours * 3600 + minutes * 60 + seconds;
+                    Logger.debug(`系统倒计时: ${hours}小时${minutes}分${seconds}秒 (剩余${totalSeconds}秒)`);
+                } else {
+                    // 尝试匹配: 小时+秒 格式(无分钟)
+                    match = text.match(/还需\s*(\d+)\s*小时\s*(\d+)\s*秒/);
+                    if (match) {
+                        hours = parseInt(match[1]);
+                        seconds = parseInt(match[2]);
+                        totalSeconds = hours * 3600 + seconds;
+                        Logger.debug(`系统倒计时: ${hours}小时${seconds}秒 (剩余${totalSeconds}秒)`);
+                    } else {
+                        // 尝试匹配有分钟的格式
+                        match = text.match(/还需\s*(\d+)\s*分(?:钟)?\s*(\d+)\s*秒/);
+                        if (match) {
+                            minutes = parseInt(match[1]);
+                            seconds = parseInt(match[2]);
+                            totalSeconds = minutes * 60 + seconds;
+                            Logger.debug(`系统倒计时: ${minutes}分${seconds}秒 (剩余${totalSeconds}秒)`);
+                        } else {
+                            // 尝试匹配只有秒的格式
+                            match = text.match(/还需\s*(\d+)\s*秒/);
+                            if (match) {
+                                seconds = parseInt(match[1]);
+                                totalSeconds = seconds;
+                                Logger.debug(`系统倒计时: ${seconds}秒 (剩余${totalSeconds}秒)`);
+                            }
+                        }
+                    }
+                }
+                
+                // 如果找到了倒计时
+                if (totalSeconds > 0) {
                     // 如果倒计时小于等于3秒,认为已完成
                     if (totalSeconds <= 3) {
                         Logger.log('倒计时归零,学习完成');
@@ -546,13 +622,64 @@
             const countdownElement = document.querySelector('.yxtbiz-language-slot, .yxtulcdsdk-course-player__countdown');
             if (countdownElement) {
                 const text = countdownElement.textContent || '';
-                const match = text.match(/还需\s*.*?(\d+)\s*分钟\s*(\d+)\s*秒/);
-                if (match) {
-                    const minutes = match[1];
-                    const seconds = match[2];
-                    systemCountdown = `<div style="color: #FFD700; font-weight: bold;">⏱ 系统要求: 还需${minutes}分${seconds}秒</div>`;
-                } else if (text.includes('已完成') || text.includes('恭喜')) {
-                    systemCountdown = `<div style="color: #4CAF50; font-weight: bold;">✅ 已完成学习要求</div>`;
+                
+                // 检查是否为PDF课件("需完成课程内容")
+                if (/需完成课程内容/.test(text) && /学分/.test(text)) {
+                    // 提取学分数字
+                    const creditMatch = text.match(/([\d.]+)\s*学分/);
+                    const credit = creditMatch ? creditMatch[1] : '未知';
+                    
+                    // 检查是否已完成
+                    const nextButton = document.querySelector('.ulcdsdk-nextchapterbutton');
+                    const currentCourse = document.querySelector('.yxtulcdsdk-catalog .liactive');
+                    const isCompleted = (nextButton && nextButton.offsetParent !== null) || 
+                                       (currentCourse && currentCourse.querySelector('svg path[stroke="#FFF"]'));
+                    
+                    if (isCompleted) {
+                        systemCountdown = `<div style="color: #4CAF50; font-weight: bold;">📄 PDF课件已完成 (${credit}学分)</div>`;
+                    } else {
+                        systemCountdown = `<div style="color: #FFD700; font-weight: bold;">📄 PDF课件: 等待完成标记 (${credit}学分)</div>`;
+                    }
+                } else {
+                    // 适配多种格式:
+                    // 1. "还需 2小时 2分钟 58秒" (小时+分钟+秒)
+                    // 2. "还需 2小时 4秒" (小时+秒,无分钟)
+                    // 3. "还需 7分钟 30秒" 或 "还需 7分 30秒" (分钟+秒)
+                    // 4. "还需 22秒" (只有秒数)
+                    
+                    // 优先匹配: 小时+分钟+秒
+                    let match = text.match(/还需\s*(\d+)\s*小时\s*(\d+)\s*分(?:钟)?\s*(\d+)\s*秒/);
+                    if (match) {
+                        const hours = match[1];
+                        const minutes = match[2];
+                        const seconds = match[3];
+                        systemCountdown = `<div style="color: #FFD700; font-weight: bold;">⏱ 系统要求: 还需${hours}小时${minutes}分${seconds}秒</div>`;
+                    } else {
+                        // 尝试匹配: 小时+秒(无分钟)
+                        match = text.match(/还需\s*(\d+)\s*小时\s*(\d+)\s*秒/);
+                        if (match) {
+                            const hours = match[1];
+                            const seconds = match[2];
+                            systemCountdown = `<div style="color: #FFD700; font-weight: bold;">⏱ 系统要求: 还需${hours}小时${seconds}秒</div>`;
+                        } else {
+                            // 尝试匹配分钟+秒
+                            match = text.match(/还需\s*(\d+)\s*分(?:钟)?\s*(\d+)\s*秒/);
+                            if (match) {
+                                const minutes = match[1];
+                                const seconds = match[2];
+                                systemCountdown = `<div style="color: #FFD700; font-weight: bold;">⏱ 系统要求: 还需${minutes}分${seconds}秒</div>`;
+                            } else {
+                                // 尝试匹配只有秒的格式
+                                match = text.match(/还需\s*(\d+)\s*秒/);
+                                if (match) {
+                                    const seconds = match[1];
+                                    systemCountdown = `<div style="color: #FFD700; font-weight: bold;">⏱ 系统要求: 还需${seconds}秒</div>`;
+                                } else if (text.includes('已完成') || text.includes('恭喜')) {
+                                    systemCountdown = `<div style="color: #4CAF50; font-weight: bold;">✅ 已完成学习要求</div>`;
+                                }
+                            }
+                        }
+                    }
                 }
             }
             
@@ -629,31 +756,52 @@
                 // 等待页面跳转,然后重新启动自动播放
                 setTimeout(() => {
                     Logger.log('页面已跳转到下一章节,准备重新启动...');
-                    this.autoPlayer.start();
+                    if (this.autoPlayer) {
+                        this.autoPlayer.start();
+                    }
                 }, 3000);
                 return;
             }
             
-            // 优先使用网站原生导航函数
+            // 方法2: 通过课程大纲查找下一个未完成的课程
+            if (this.findAndClickNextCourseInCatalog()) {
+                setTimeout(() => {
+                    Logger.log('已通过课程大纲跳转到下一课程,准备重新启动...');
+                    if (this.autoPlayer) {
+                        this.autoPlayer.start();
+                    }
+                }, 3000);
+                return;
+            }
+            
+            // 方法3: 优先使用网站原生导航函数
             try {
                 if (unsafeWindow.next && typeof unsafeWindow.next === 'function') {
                     Logger.log('使用原生next()函数');
                     unsafeWindow.next();
-                    setTimeout(() => this.autoPlayer.start(), 3000);
+                    setTimeout(() => {
+                        if (this.autoPlayer) {
+                            this.autoPlayer.start();
+                        }
+                    }, 3000);
                     return;
                 }
                 
                 if (unsafeWindow.nextPage && typeof unsafeWindow.nextPage === 'function') {
                     Logger.log('使用原生nextPage()函数');
                     unsafeWindow.nextPage();
-                    setTimeout(() => this.autoPlayer.start(), 3000);
+                    setTimeout(() => {
+                        if (this.autoPlayer) {
+                            this.autoPlayer.start();
+                        }
+                    }, 3000);
                     return;
                 }
             } catch (error) {
                 Logger.debug('原生函数调用失败', error);
             }
             
-            // 查找"继续学习"或"下一个"按钮 (根据HTML分析结果优化)
+            // 方法4: 查找"继续学习"或"下一个"按钮 (根据HTML分析结果优化)
             const buttonSelectors = [
                 // 完成对话框按钮
                 'button:has-text("继续学习下一章节")',
@@ -685,7 +833,11 @@
                              text.includes('Continue'))) {
                             Logger.log('点击下一个按钮', {selector, text});
                             btn.click();
-                            setTimeout(() => this.autoPlayer.start(), 3000);
+                            setTimeout(() => {
+                                if (this.autoPlayer) {
+                                    this.autoPlayer.start();
+                                }
+                            }, 3000);
                             return;
                         }
                     }
@@ -694,7 +846,7 @@
                 }
             }
             
-            // 最后尝试通过文本查找
+            // 方法5: 最后尝试通过文本查找
             const allButtons = Array.from(document.querySelectorAll('button, a, div[role="button"]'));
             for (const btn of allButtons) {
                 const text = btn.textContent.trim();
@@ -710,6 +862,57 @@
             }
 
             Logger.log('未找到下一个按钮，当前课程学习完成');
+        }
+
+        // 通过课程大纲查找并点击下一个未完成的课程
+        findAndClickNextCourseInCatalog() {
+            Logger.log('尝试通过课程大纲查找下一个未完成课程...');
+            
+            // 查找课程大纲容器
+            const catalog = document.querySelector('.yxtulcdsdk-catalog');
+            if (!catalog) {
+                Logger.debug('未找到课程大纲容器');
+                return false;
+            }
+            
+            // 获取所有课程项
+            const courseItems = catalog.querySelectorAll('li');
+            let foundCurrent = false;
+            
+            for (const item of courseItems) {
+                // 跳过章节标题（只处理课程项）
+                const courseNameElement = item.querySelector('.item');
+                if (!courseNameElement) continue;
+                
+                // 如果是当前正在学习的课程
+                if (item.classList.contains('liactive')) {
+                    foundCurrent = true;
+                    Logger.debug('找到当前课程:', courseNameElement.textContent.trim());
+                    continue;
+                }
+                
+                // 如果已经找到当前课程,检查下一个课程是否未完成
+                if (foundCurrent) {
+                    // 检查是否为未完成课程（空心圆图标或半圆图标）
+                    const statusIcon = item.querySelector('svg');
+                    if (statusIcon) {
+                        const iconPath = statusIcon.querySelector('path[fill="currentColor"]');
+                        const isCompleted = statusIcon.querySelector('path[stroke="#FFF"]');
+                        
+                        // 如果不是已完成状态（没有绿色对勾）
+                        if (!isCompleted && iconPath) {
+                            Logger.success('找到下一个未完成课程:', courseNameElement.textContent.trim());
+                            // 点击课程项
+                            const clickTarget = item.querySelector('.hand') || item;
+                            clickTarget.click();
+                            return true;
+                        }
+                    }
+                }
+            }
+            
+            Logger.debug('未在课程大纲中找到下一个未完成课程');
+            return false;
         }
 
         // 停止监控
@@ -933,6 +1136,8 @@
         init() {
             this.createPanel();
             this.attachEvents();
+            // 确保面板显示与配置同步（解决页面CSS覆盖导致的不可见问题）
+            if (typeof this.syncUI === 'function') this.syncUI();
         }
 
         createPanel() {
@@ -999,12 +1204,15 @@
                             <label style="display: flex; align-items: center; margin-bottom: 5px;">
                                 <span style="flex: 1;">播放速度:</span>
                                 <select id="famsun-speed-select" style="
-                                    padding: 5px;
-                                    border-radius: 3px;
-                                    border: none;
-                                    background: white;
-                                    color: #333;
-                                    cursor: pointer;
+                                    padding: 6px !important;
+                                    border-radius: 4px !important;
+                                    border: 1px solid rgba(0,0,0,0.12) !important;
+                                    background: #ffffff !important;
+                                    color: #333333 !important;
+                                    cursor: pointer !important;
+                                    min-width: 90px !important;
+                                    width: 90px !important;
+                                    box-sizing: border-box !important;
                                 ">
                                     <option value="0.5">x0.5</option>
                                     <option value="0.75">x0.75</option>
@@ -1313,50 +1521,105 @@
         async clickStartButton() {
             Logger.log('查找开始学习/继续学习按钮...');
             
-            // 定义按钮选择器和关键词
+            // 定义按钮选择器和关键词（优先级从高到低）
             const buttonSelectors = [
                 // YXT框架按钮
                 '.yxtf-button--primary',
                 '.yxtf-button',
-                'button.yxt-button'
+                'button.yxt-button',
+                // ULCD SDK按钮（新增）
+                '.yxtulcdsdk-nextchapterbutton',
+                'button[class*="yxtulcdsdk"]',
+                // 通用按钮
+                'button',
+                'div[role="button"]',
+                'a[role="button"]'
             ];
             
-            const keywords = [
-                '开始学习',
-                '继续学习',
-                '播放'
-            ];
+            // 重试机制：最多尝试15次，每次间隔1秒
+            const maxRetries = 15;
+            let retryCount = 0;
             
-            // 尝试查找并点击按钮
-            for (const selector of buttonSelectors) {
-                try {
-                    const buttons = document.querySelectorAll(selector);
-                    for (const btn of buttons) {
-                        // 排除脚本自己的按钮
-                        if (btn.id === 'famsun-start-btn' || btn.id === 'famsun-stop-btn') {
-                            continue;
-                        }
-                        
-                        const text = btn.textContent.trim();
-                        const isVisible = btn.offsetParent !== null;
-                        
-                        // 检查按钮是否可见且文本匹配关键词
-                        if (isVisible) {
-                            for (const keyword of keywords) {
-                                if (text.includes(keyword)) {
-                                    Logger.log(`找到按钮: "${text}" (选择器: ${selector})`);
-                                    btn.click();
-                                    return true;
+            while (retryCount < maxRetries) {
+                // 收集所有可能的按钮及其优先级
+                const foundButtons = [];
+                
+                for (const selector of buttonSelectors) {
+                    try {
+                        const buttons = document.querySelectorAll(selector);
+                        for (const btn of buttons) {
+                            // 排除脚本自己的按钮
+                            if (btn.id === 'famsun-start-btn' || btn.id === 'famsun-stop-btn') {
+                                continue;
+                            }
+                            
+                            const text = btn.textContent.trim();
+                            const isVisible = btn.offsetParent !== null;
+                            
+                            if (isVisible && text) {
+                                // 判断按钮类型和优先级
+                                let priority = 0;
+                                let buttonType = '';
+                                
+                                if (text.includes('下一个') || text.includes('下一章') || text.includes('下一节')) {
+                                    priority = 1; // 最高优先级：下一个
+                                    buttonType = '下一个';
+                                } else if (text.includes('开始学习') || text.includes('开始播放')) {
+                                    priority = 2; // 次优先级：开始学习/播放
+                                    buttonType = '开始学习';
+                                } else if (text.includes('继续学习') || text.includes('继续播放')) {
+                                    priority = 3; // 第三优先级：继续学习
+                                    buttonType = '继续学习';
+                                } else if (text.includes('播放') && !text.includes('倍速') && !text.includes('播放器')) {
+                                    priority = 4; // 第四优先级：播放
+                                    buttonType = '播放';
+                                }
+                                
+                                if (priority > 0) {
+                                    foundButtons.push({
+                                        button: btn,
+                                        priority,
+                                        buttonType,
+                                        text,
+                                        selector
+                                    });
                                 }
                             }
                         }
+                    } catch (error) {
+                        Logger.debug(`选择器失败: ${selector}`, error);
                     }
-                } catch (error) {
-                    Logger.debug(`选择器失败: ${selector}`, error);
+                }
+                
+                // 按优先级排序（priority 小的优先）
+                foundButtons.sort((a, b) => a.priority - b.priority);
+                
+                // 如果找到了按钮，点击并返回
+                if (foundButtons.length > 0) {
+                    // 特殊处理：如果同时存在"下一个"和"继续学习"，优先点击"下一个"
+                    const hasNext = foundButtons.some(item => item.priority === 1);
+                    const hasContinue = foundButtons.some(item => item.priority === 3);
+                    
+                    if (hasNext && hasContinue) {
+                        Logger.log('检测到同时存在"下一个"和"继续学习"按钮，优先点击"下一个"');
+                    }
+                    
+                    const targetButton = foundButtons[0];
+                    Logger.success(`找到按钮: "${targetButton.text}" (类型: ${targetButton.buttonType}, 选择器: ${targetButton.selector})`);
+                    targetButton.button.click();
+                    return true;
+                }
+                
+                // 未找到按钮，等待后重试
+                retryCount++;
+                if (retryCount < maxRetries) {
+                    Logger.debug(`第 ${retryCount}/${maxRetries} 次未找到按钮，等待1秒后重试...`);
+                    await this.sleep(1000);
+                } else {
+                    Logger.warn(`尝试 ${maxRetries} 次后仍未找到开始学习按钮，可能已经在播放页面或按钮未渲染`);
                 }
             }
             
-            Logger.log('未找到开始学习按钮，可能已经在播放页面');
             return false;
         }
 
